@@ -38,9 +38,12 @@ func main() {
 		mb, _ := strconv.ParseInt(env("MAX_BYTES", "268435456"), 10, 64)
 		loss, _ := strconv.ParseFloat(env("LOSS", "0"), 64)
 		rs, _ := strconv.Atoi(env("REPAIR_INTERVAL", "10"))
+		on, _ := strconv.Atoi(env("ONION", "0"))
+		od, _ := strconv.Atoi(env("ONION_DELAY_MS", "20"))
+		cv, _ := strconv.ParseFloat(env("COVER_RATE", "0"), 64)
 		n, err := NewNode(Config{Port: port, HTTP: env("HTTP", ":8080"), Discover: parseDiscover(env("DISCOVER", "")),
 			Replication: rep, MaxBytes: mb, Loss: loss, DataDir: env("DATA_DIR", ""), NodeName: env("NODE_NAME", ""),
-			RepairEvery: time.Duration(rs) * time.Second})
+			RepairEvery: time.Duration(rs) * time.Second, Onion: on, OnionDelay: time.Duration(od) * time.Millisecond, Cover: cv})
 		if err != nil {
 			log.Fatal(err)
 		}

@@ -18,15 +18,15 @@ import (
 )
 
 const (
-	shardSize = 640 // multiple of 64 (GF16 codec); keeps datagrams < MTU with a depth-16 proof
+	shardSize = 256 // multiple of 64 (GF16 codec); a STORE plus a reply block must fit one onion packet
 	maxLeaves = 65536
 )
 
 // segSize is the plaintext size of one segment. Each segment is its own
 // Reed-Solomon codeword with its own Merkle root, which lifts the 65 536-shard
 // limit of a single codeword: files of any size are streamed segment by segment.
-// 16 MiB (+96 B of cipher overhead) is ~52 430 shards, safely under the limit.
-var segSize = 16 << 20
+// 8 MiB minus 64 KiB (+96 B of cipher overhead) is ~65 000 shards at 256 B, just under the limit.
+var segSize = 8<<20 - 64<<10
 
 // Seg is one independently coded and committed piece of the file.
 type Seg struct {
@@ -167,7 +167,7 @@ func (n *Node) putSegment(ctx context.Context, master []byte, idx uint32, pt []b
 			ok := false
 			if h.self {
 				ok = n.putLocal(root, uint32(i), uint32(total), shards[i], proof, false) == 0
-			} else if m, err := n.call(ctx, h.addr, tStore, encStore(root, uint32(i), uint32(total), shards[i], proof), 500*time.Millisecond, 4); err == nil {
+			} else if m, err := n.rpc(ctx, h, tStore, encStore(root, uint32(i), uint32(total), shards[i], proof), 500*time.Millisecond, 4); err == nil {
 				ok = len(m.body) > 0 && m.body[0] == 0
 			}
 			if ok {
@@ -201,7 +201,7 @@ func (n *Node) fetchShard(ctx context.Context, root Hash, total, i int) ([]byte,
 			}
 			continue
 		}
-		m, err := n.call(ctx, h.addr, tGet, encGet(root, uint32(i)), 400*time.Millisecond, 2)
+		m, err := n.rpc(ctx, h, tGet, encGet(root, uint32(i)), 400*time.Millisecond, 2)
 		if err != nil || len(m.body) == 0 || m.body[0] != 0 {
 			continue
 		}

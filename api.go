@@ -30,7 +30,7 @@ func (n *Node) status() map[string]any {
 	}
 	return map[string]any{"id": hex.EncodeToString(n.id[:4]), "peers": len(ps), "peer_list": pl,
 		"shards": shards, "bytes": bytes, "replication": n.cfg.Replication, "loss": n.cfg.Loss,
-		"persistent": n.cfg.DataDir != "", "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
+		"persistent": n.cfg.DataDir != "", "onion": n.cfg.Onion, "onion_relayed": n.relayed.Load(), "onion_delivered": n.delivered.Load(), "onion_dropped": n.dropped.Load(), "get_direct": n.getDirect.Load(), "get_onion": n.getOnion.Load(), "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
 }
 
 func (n *Node) serveHTTP() error {

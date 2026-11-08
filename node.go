@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/rand"
-	"encoding/binary"
+	"crypto/sha256"
 	"errors"
 	"log"
 	"math/big"
@@ -30,17 +31,47 @@ type Config struct {
 	DataDir     string        // empty = in-memory only
 	NodeName    string        // stable per-replica subdirectory under DataDir
 	RepairEvery time.Duration // 0 disables repair
+
+	Onion      int           // 0 direct, 1 onion routes for client requests (direct if no route), 2 onion only
+	OnionDelay time.Duration // max random delay a relay adds per hop
+	Cover      float64       // dummy onion packets per second
+}
+
+// nbr is what a peer told us about one of its own peers: the key and the
+// address *that peer* uses to reach it. This is the reachability graph that
+// onion paths are drawn from (consecutive hops must be able to talk).
+type nbr struct {
+	pub  [32]byte
+	addr netip.AddrPort
+	seen time.Time
 }
 
 type peer struct {
-	id   Hash
-	addr netip.AddrPort
-	seen time.Time
+	id     Hash
+	addr   netip.AddrPort
+	seen   time.Time
+	pub    [32]byte
+	hasPub bool
+	me     netip.AddrPort // how this peer sees us
+	nbrs   map[Hash]nbr
+}
+
+// idOf binds a node id to its onion key, so a key cannot be claimed for a
+// foreign id.
+func idOf(pub []byte) Hash {
+	h := sha256.New()
+	h.Write([]byte("da/node/v1"))
+	h.Write(pub)
+	var o Hash
+	h.Sum(o[:0])
+	return o
 }
 
 type Node struct {
 	cfg  Config
 	id   Hash
+	priv *ecdh.PrivateKey
+	pub  [32]byte
 	conn *net.UDPConn
 
 	mu    sync.RWMutex
@@ -50,8 +81,17 @@ type Node struct {
 
 	store *shardStore
 
+	smu   sync.Mutex
+	surbs map[uint64]*surbEntry
+	seen  map[[16]byte]time.Time
+	hook  func(from netip.AddrPort, typ byte, viaOnion bool) // tests: observe who talks to a server
+
+	relayed, delivered, dropped atomic.Int64
+	getDirect, getOnion         atomic.Int64
+
 	repMu    sync.Mutex
 	cool     map[Hash]time.Time
+	cursor   map[Hash]int // repair loop only
 	pushed   atomic.Int64
 	rebuilds atomic.Int64
 
@@ -78,8 +118,9 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{cfg: cfg, conn: c, peers: map[Hash]*peer{}, tried: map[netip.AddrPort]time.Time{},
-		pend: map[uint64]chan msg{}, store: st, cool: map[Hash]time.Time{}, done: make(chan struct{})}
-	if err := n.loadID(dir); err != nil {
+		pend: map[uint64]chan msg{}, store: st, cool: map[Hash]time.Time{}, cursor: map[Hash]int{}, done: make(chan struct{}),
+		surbs: map[uint64]*surbEntry{}, seen: map[[16]byte]time.Time{}}
+	if err := n.loadKey(dir); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -91,26 +132,41 @@ func NewNode(cfg Config) (*Node, error) {
 	if cfg.RepairEvery > 0 {
 		go n.repairLoop()
 	}
+	if cfg.Cover > 0 {
+		go n.coverLoop()
+	}
 	return n, nil
 }
 
-// loadID keeps the node ID stable across restarts, so placement stays valid.
-func (n *Node) loadID(dir string) error {
-	if dir == "" {
-		_, err := rand.Read(n.id[:])
-		return err
-	}
-	p := filepath.Join(dir, "node.id")
-	if b, err := os.ReadFile(p); err == nil {
-		if len(b) == 32 {
-			copy(n.id[:], b)
+// loadKey keeps the node key (and so its id) stable across restarts, so
+// placement stays valid.
+func (n *Node) loadKey(dir string) error {
+	curve := ecdh.X25519()
+	if dir != "" {
+		if b, err := os.ReadFile(filepath.Join(dir, "node.key")); err == nil && len(b) == 32 {
+			k, err := curve.NewPrivateKey(b)
+			if err != nil {
+				return err
+			}
+			n.setKey(k)
 			return nil
 		}
 	}
-	if _, err := rand.Read(n.id[:]); err != nil {
+	k, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, n.id[:], 0o600)
+	n.setKey(k)
+	if dir != "" {
+		return os.WriteFile(filepath.Join(dir, "node.key"), k.Bytes(), 0o600)
+	}
+	return nil
+}
+
+func (n *Node) setKey(k *ecdh.PrivateKey) {
+	n.priv = k
+	copy(n.pub[:], k.PublicKey().Bytes())
+	n.id = idOf(n.pub[:])
 }
 
 func (n *Node) Close() { n.once.Do(func() { close(n.done); n.conn.Close() }) }
@@ -144,7 +200,9 @@ func (n *Node) recvLoop() {
 			continue
 		}
 		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
-		n.upsert(m.from, src)
+		if m.typ != tOnion {
+			n.upsert(m.from, src)
+		}
 		go n.handle(m, src)
 	}
 }
@@ -156,44 +214,86 @@ func (n *Node) upsert(id Hash, a netip.AddrPort) {
 		p.addr, p.seen = a, time.Now()
 		return
 	}
-	n.peers[id] = &peer{id, a, time.Now()}
+	n.peers[id] = &peer{id: id, addr: a, seen: time.Now(), nbrs: map[Hash]nbr{}}
 }
 
 func (n *Node) handle(m msg, src netip.AddrPort) {
 	switch m.typ {
 	case tPing:
-		n.send(src, msg{typ: tPong, id: m.id, body: n.gossipBody()})
+		pub := m.body
+		if len(pub) < 32 || idOf(pub[:32]) != m.from {
+			return
+		}
+		n.setPub(m.from, pub[:32])
+		b := append([]byte{}, n.pub[:]...)
+		b = append(b, make([]byte, 6)...)
+		putAddr(b[32:], src)
+		n.send(src, msg{typ: tPong, id: m.id, body: append(b, n.gossipBody()...)})
 	case tPong:
-		n.learn(m.body)
+		r := &rd{b: m.body}
+		pub := r.take(32)
+		me := getAddr(r.take(6))
+		if r.bad || idOf(pub) != m.from {
+			return
+		}
+		n.setPub(m.from, pub)
+		n.learn(m.from, me, r.b)
 		n.deliver(m)
 	case tAck, tData, tHasR:
 		n.deliver(m)
+	case tStore, tGet, tHas:
+		if n.hook != nil {
+			n.hook(src, m.typ, false)
+		}
+		if m.typ == tGet {
+			n.getDirect.Add(1)
+		}
+		if rt, rb, ok := n.serve(m.typ, m.body); ok {
+			n.send(src, msg{typ: rt, id: m.id, body: rb})
+		}
+	case tOnion:
+		n.handleOnion(m, src)
+	}
+}
+
+// serve executes a storage request and returns the reply. It is shared by the
+// direct path and the onion path, so a request is handled identically whether
+// or not it knows who is asking.
+func (n *Node) serve(typ byte, body []byte) (byte, []byte, bool) {
+	r := &rd{b: body}
+	switch typ {
 	case tStore:
-		r := &rd{b: m.body}
 		root, leaf, cnt := r.hash(), r.u32(), r.u32()
 		data := append([]byte(nil), r.take(int(r.u16()))...)
 		proof := r.proof()
-		status := n.putLocal(root, leaf, cnt, data, proof, r.bad)
-		n.send(src, msg{typ: tAck, id: m.id, body: []byte{status}})
+		return tAck, []byte{n.putLocal(root, leaf, cnt, data, proof, r.bad)}, true
 	case tGet:
-		r := &rd{b: m.body}
 		root, leaf := r.hash(), r.u32()
 		if r.bad {
-			return
+			return 0, nil, false
 		}
 		s, ok := n.store.get(root, leaf)
-		n.send(src, msg{typ: tData, id: m.id, body: encData(ok, s.n, s.data, s.proof)})
+		return tData, encData(ok, s.n, s.data, s.proof), true
 	case tHas:
-		r := &rd{b: m.body}
 		root, leaf := r.hash(), r.u32()
 		if r.bad {
-			return
+			return 0, nil, false
 		}
 		st := byte(1)
 		if n.store.has(root, leaf) {
 			st = 0
 		}
-		n.send(src, msg{typ: tHasR, id: m.id, body: []byte{st}})
+		return tHasR, []byte{st}, true
+	}
+	return 0, nil, false
+}
+
+func (n *Node) setPub(id Hash, pub []byte) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if p, ok := n.peers[id]; ok {
+		copy(p.pub[:], pub)
+		p.hasPub = true
 	}
 }
 
@@ -247,36 +347,56 @@ func (n *Node) gossipBody() []byte {
 	n.mu.RLock()
 	ps := make([]*peer, 0, len(n.peers))
 	for _, p := range n.peers {
-		ps = append(ps, p)
+		if p.hasPub {
+			ps = append(ps, p)
+		}
 	}
-	n.mu.RUnlock()
 	mrand.Shuffle(len(ps), func(i, j int) { ps[i], ps[j] = ps[j], ps[i] })
 	if len(ps) > 12 {
 		ps = ps[:12]
 	}
 	b := []byte{byte(len(ps))}
 	for _, p := range ps {
-		a := p.addr.Addr().As4()
-		b = append(b, a[:]...)
-		b = binary.BigEndian.AppendUint16(b, p.addr.Port())
+		b = append(b, p.pub[:]...)
+		b = append(b, make([]byte, 6)...)
+		putAddr(b[len(b)-6:], p.addr)
 	}
+	n.mu.RUnlock()
 	return b
 }
 
-// learn pings gossiped addresses; they only become peers once they answer
-// directly (so unreachable cross-subnet addresses never enter the table).
-func (n *Node) learn(body []byte) {
+func (n *Node) sendPing(to netip.AddrPort) {
+	n.send(to, msg{typ: tPing, id: mrand.Uint64(), body: append([]byte{}, n.pub[:]...)})
+}
+
+// learn records what a peer reports about its own peers (key + the address it
+// uses), and pings unknown addresses; they only become peers once they answer
+// directly, so unreachable cross-subnet addresses never enter the table.
+func (n *Node) learn(from Hash, me netip.AddrPort, body []byte) {
+	n.mu.Lock()
+	if p, ok := n.peers[from]; ok {
+		p.me = me
+	}
+	n.mu.Unlock()
 	r := &rd{b: body}
 	cnt := int(r.u8())
 	for i := 0; i < cnt; i++ {
-		var a [4]byte
-		copy(a[:], r.take(4))
-		port := r.u16()
+		pub := append([]byte(nil), r.take(32)...)
+		ap := getAddr(r.take(6))
 		if r.bad {
 			return
 		}
-		ap := netip.AddrPortFrom(netip.AddrFrom4(a), port)
+		id := idOf(pub)
+		if id == n.id {
+			continue
+		}
 		n.mu.Lock()
+		if p, ok := n.peers[from]; ok {
+			var rec nbr
+			copy(rec.pub[:], pub)
+			rec.addr, rec.seen = ap, time.Now()
+			p.nbrs[id] = rec
+		}
 		t, seen := n.tried[ap]
 		known := false
 		for _, p := range n.peers {
@@ -288,7 +408,7 @@ func (n *Node) learn(body []byte) {
 		if !known && (!seen || time.Since(t) > 10*time.Second) {
 			n.tried[ap] = time.Now()
 			n.mu.Unlock()
-			n.send(ap, msg{typ: tPing, id: mrand.Uint64()})
+			n.sendPing(ap)
 			continue
 		}
 		n.mu.Unlock()
@@ -326,20 +446,28 @@ func (n *Node) maintainLoop() {
 				delete(n.peers, id)
 			}
 		}
+		for _, p := range n.peers {
+			for id, nb := range p.nbrs {
+				if time.Since(nb.seen) > 30*time.Second {
+					delete(p.nbrs, id)
+				}
+			}
+		}
 		for a, ts := range n.tried {
 			if time.Since(ts) > time.Minute {
 				delete(n.tried, a)
 			}
 		}
 		n.mu.Unlock()
+		n.pruneOnion()
 
 		for _, a := range n.resolve() {
-			n.send(a, msg{typ: tPing, id: mrand.Uint64()})
+			n.sendPing(a)
 		}
 		ps := n.peerList()
 		mrand.Shuffle(len(ps), func(i, j int) { ps[i], ps[j] = ps[j], ps[i] })
 		for i := 0; i < len(ps) && i < 4; i++ {
-			n.send(ps[i].addr, msg{typ: tPing, id: mrand.Uint64()})
+			n.sendPing(ps[i].addr)
 		}
 		select {
 		case <-t.C:
@@ -354,7 +482,9 @@ func (n *Node) peerList() []peer {
 	defer n.mu.RUnlock()
 	out := make([]peer, 0, len(n.peers))
 	for _, p := range n.peers {
-		out = append(out, *p)
+		c := *p
+		c.nbrs = nil // never share the map outside the lock
+		out = append(out, c)
 	}
 	return out
 }
