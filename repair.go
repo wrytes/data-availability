@@ -183,7 +183,7 @@ func (n *Node) tryRebuild(ctx context.Context, root Hash, total int, missing []u
 // root and pushes every copy that a current holder lacks.
 func (n *Node) rebuild(ctx context.Context, root Hash, total int) (int, error) {
 	k := total / 2
-	got, err := n.gather(ctx, root, total, k)
+	got, err := n.gather(ctx, root, total, k, nil)
 	if err != nil {
 		return 0, err
 	}

@@ -35,6 +35,7 @@ type Config struct {
 	Onion      int           // 0 direct, 1 onion routes for client requests (direct if no route), 2 onion only
 	OnionDelay time.Duration // max random delay a relay adds per hop
 	Cover      float64       // dummy onion packets per second
+	Hidden     bool          // hidden holder: never listed, ignores direct requests, reachable only via rendezvous
 }
 
 // nbr is what a peer told us about one of its own peers: the key and the
@@ -81,6 +82,11 @@ type Node struct {
 
 	store *shardStore
 
+	hsMu    sync.Mutex
+	hs      hsState
+	svc     *service // set on hidden nodes
+	private map[Hash]bool
+
 	smu   sync.Mutex
 	surbs map[uint64]*surbEntry
 	seen  map[[16]byte]time.Time
@@ -119,7 +125,7 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	n := &Node{cfg: cfg, conn: c, peers: map[Hash]*peer{}, tried: map[netip.AddrPort]time.Time{},
 		pend: map[uint64]chan msg{}, store: st, cool: map[Hash]time.Time{}, cursor: map[Hash]int{}, done: make(chan struct{}),
-		surbs: map[uint64]*surbEntry{}, seen: map[[16]byte]time.Time{}}
+		hs: newHsState(), private: map[Hash]bool{}, surbs: map[uint64]*surbEntry{}, seen: map[[16]byte]time.Time{}}
 	if err := n.loadKey(dir); err != nil {
 		c.Close()
 		return nil, err
@@ -134,6 +140,15 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	if cfg.Cover > 0 {
 		go n.coverLoop()
+	}
+	if cfg.Hidden {
+		svc, err := loadService(dir)
+		if err != nil {
+			c.Close()
+			return nil, err
+		}
+		n.svc = svc
+		go n.hsLoop()
 	}
 	return n, nil
 }
@@ -200,11 +215,26 @@ func (n *Node) recvLoop() {
 			continue
 		}
 		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
-		if m.typ != tOnion {
+		if m.typ == tPing && len(m.body) > 32 && m.body[32]&1 != 0 {
+			n.markPrivate(m.from) // hidden node: answer so it learns its address, never list it
+		} else if m.typ != tOnion && !n.isPrivate(m.from) {
 			n.upsert(m.from, src)
 		}
 		go n.handle(m, src)
 	}
+}
+
+func (n *Node) markPrivate(id Hash) {
+	n.mu.Lock()
+	n.private[id] = true
+	delete(n.peers, id)
+	n.mu.Unlock()
+}
+
+func (n *Node) isPrivate(id Hash) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.private[id]
 }
 
 func (n *Node) upsert(id Hash, a netip.AddrPort) {
@@ -218,6 +248,9 @@ func (n *Node) upsert(id Hash, a netip.AddrPort) {
 }
 
 func (n *Node) handle(m msg, src netip.AddrPort) {
+	if n.cfg.Hidden && (m.typ == tPing || m.typ == tStore || m.typ == tGet || m.typ == tHas) {
+		return // a hidden node never answers on the open network
+	}
 	switch m.typ {
 	case tPing:
 		pub := m.body
@@ -366,7 +399,11 @@ func (n *Node) gossipBody() []byte {
 }
 
 func (n *Node) sendPing(to netip.AddrPort) {
-	n.send(to, msg{typ: tPing, id: mrand.Uint64(), body: append([]byte{}, n.pub[:]...)})
+	body := append([]byte{}, n.pub[:]...)
+	if n.cfg.Hidden {
+		body = append(body, 1) // private: do not list or gossip me
+	}
+	n.send(to, msg{typ: tPing, id: mrand.Uint64(), body: body})
 }
 
 // learn records what a peer reports about its own peers (key + the address it
@@ -405,7 +442,7 @@ func (n *Node) learn(from Hash, me netip.AddrPort, body []byte) {
 				break
 			}
 		}
-		if !known && (!seen || time.Since(t) > 10*time.Second) {
+		if !known && !n.cfg.Hidden && (!seen || time.Since(t) > 10*time.Second) {
 			n.tried[ap] = time.Now()
 			n.mu.Unlock()
 			n.sendPing(ap)

@@ -49,6 +49,7 @@ const (
 	kReq   = 1
 	kReply = 2
 	kDummy = 3
+	kPost  = 4 // request without a reply block
 )
 
 type hop struct {

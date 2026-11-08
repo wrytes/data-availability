@@ -20,6 +20,7 @@ type surbEntry struct {
 	ch   chan reply
 	fn   func(typ byte, body []byte) // for unsolicited deliveries (hidden services)
 	exp  time.Time
+	tag  Hash // which introduction point a hidden node registered this block with
 }
 
 type reply struct {
@@ -102,6 +103,12 @@ func (n *Node) onionRequest(delta []byte, prev netip.AddrPort) {
 		if ok {
 			n.sendReply(sb, rt, rb)
 		}
+	case kPost:
+		typ, body := delta[zeroLen+1], delta[zeroLen+2:]
+		if n.hook != nil {
+			n.hook(prev, typ, true)
+		}
+		n.anonServe(typ, body)
 	case kDummy:
 	}
 }
@@ -173,8 +180,8 @@ func (n *Node) onionReply(id uint64, delta []byte) {
 func (n *Node) pickFwd(dest Hash) ([]hop, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	d := n.peers[dest]
-	if d == nil || !d.hasPub {
+	dpub, ok := n.pubOfLocked(dest)
+	if !ok {
 		return nil, false
 	}
 	type cand struct{ r0, r1 *peer }
@@ -200,8 +207,20 @@ func (n *Node) pickFwd(dest Hash) ([]hop, bool) {
 	return []hop{
 		{c.r0.pub, c.r0.addr},
 		{c.r1.pub, c.r0.nbrs[c.r1.id].addr},
-		{d.pub, c.r1.nbrs[dest].addr},
+		{dpub, c.r1.nbrs[dest].addr},
 	}, true
+}
+
+func (n *Node) pubOfLocked(id Hash) ([32]byte, bool) {
+	if p := n.peers[id]; p != nil && p.hasPub {
+		return p.pub, true
+	}
+	for _, p := range n.peers {
+		if nb, ok := p.nbrs[id]; ok {
+			return nb.pub, true
+		}
+	}
+	return [32]byte{}, false
 }
 
 // pickBack draws a return path [relay, relay, me] that the destination can
@@ -287,6 +306,24 @@ func (n *Node) sendReq(path []hop, sb surb, typ byte, body []byte) error {
 	return nil
 }
 
+// sendPost sends an anonymous request that expects no answer.
+func (n *Node) sendPost(path []hop, typ byte, body []byte) error {
+	if zeroLen+2+len(body) > onionD {
+		return errors.New("post too large for one onion packet")
+	}
+	hdr, keys, err := buildHeader(path, []byte{recDeliver})
+	if err != nil {
+		return err
+	}
+	m := make([]byte, onionD)
+	m[zeroLen] = kPost
+	m[zeroLen+1] = typ
+	copy(m[zeroLen+2:], body)
+	wrapPayload(keys, m)
+	n.send(path[0].addr, msg{typ: tOnion, body: encodeOnion(hdr, m)})
+	return nil
+}
+
 func (n *Node) dropSurb(id uint64) {
 	n.smu.Lock()
 	delete(n.surbs, id)
@@ -366,6 +403,7 @@ func (n *Node) coverLoop() {
 }
 
 func (n *Node) pruneOnion() {
+	n.pruneHidden()
 	now := time.Now()
 	n.smu.Lock()
 	defer n.smu.Unlock()
