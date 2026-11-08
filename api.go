@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,7 +31,7 @@ func (n *Node) status() map[string]any {
 	}
 	return map[string]any{"id": hex.EncodeToString(n.id[:4]), "peers": len(ps), "peer_list": pl,
 		"shards": shards, "bytes": bytes, "replication": n.cfg.Replication, "loss": n.cfg.Loss,
-		"persistent": n.cfg.DataDir != "", "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
+		"persistent": n.cfg.DataDir != "", "hidden": n.cfg.Hidden, "sid": n.hexSid(), "onion": n.cfg.Onion, "onion_relayed": n.relayed.Load(), "onion_delivered": n.delivered.Load(), "onion_dropped": n.dropped.Load(), "get_direct": n.getDirect.Load(), "get_onion": n.getOnion.Load(), "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
 }
 
 func (n *Node) serveHTTP() error {
@@ -42,7 +43,15 @@ func (n *Node) serveHTTP() error {
 	}
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) { wj(w, 200, n.status()) })
 	mux.HandleFunc("POST /put", func(w http.ResponseWriter, r *http.Request) {
-		res, err := n.PutReader(r.Context(), http.MaxBytesReader(w, r.Body, maxFile))
+		var hid []Hash
+		for _, s := range strings.Split(r.URL.Query().Get("hidden"), ",") {
+			if b, err := hex.DecodeString(strings.TrimSpace(s)); err == nil && len(b) == 32 {
+				var h Hash
+				copy(h[:], b)
+				hid = append(hid, h)
+			}
+		}
+		res, err := n.PutReaderHidden(r.Context(), http.MaxBytesReader(w, r.Body, maxFile), hid)
 		if err != nil {
 			wj(w, 502, map[string]any{"error": err.Error(), "result": res})
 			return
@@ -64,7 +73,11 @@ func (n *Node) serveHTTP() error {
 		}
 		w.Header().Set("content-type", "application/octet-stream")
 		sw := &lazyWriter{w: w}
-		if err := n.GetTo(r.Context(), mf, sw); err != nil {
+		ctx := r.Context()
+		if r.URL.Query().Get("via") == "hidden" {
+			ctx = hiddenOnly(ctx)
+		}
+		if err := n.GetTo(ctx, mf, sw); err != nil {
 			if !sw.started { // nothing sent yet: report properly
 				w.Header().Set("content-type", "application/json")
 				wj(w, 502, map[string]string{"error": err.Error()})

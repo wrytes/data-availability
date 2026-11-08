@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	mrand "math/rand"
+	"sort"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -24,7 +25,7 @@ import (
 //     needs the decryption key (shards are ciphertext).
 
 const (
-	sampleHeld   = 24
+	sampleHeld   = 64 // held shards checked per root per sweep, scanned with a rotating cursor
 	sampleRandom = 12
 	rebuildGap   = 20 * time.Second
 )
@@ -94,10 +95,12 @@ func (n *Node) repairSweep() {
 		}
 		sample := map[uint32]bool{}
 		held := append([]uint32(nil), ri.leaves...)
-		mrand.Shuffle(len(held), func(i, j int) { held[i], held[j] = held[j], held[i] })
+		sort.Slice(held, func(i, j int) bool { return held[i] < held[j] })
+		start := n.cursor[root] % len(held) // full coverage in len/sampleHeld sweeps, no coupon-collector tail
 		for i := 0; i < len(held) && i < sampleHeld; i++ {
-			sample[held[i]] = true
+			sample[held[(start+i)%len(held)]] = true
 		}
+		n.cursor[root] = start + sampleHeld
 		for i := 0; i < sampleRandom; i++ {
 			sample[uint32(mrand.Intn(int(ri.n)))] = true
 		}
@@ -180,7 +183,7 @@ func (n *Node) tryRebuild(ctx context.Context, root Hash, total int, missing []u
 // root and pushes every copy that a current holder lacks.
 func (n *Node) rebuild(ctx context.Context, root Hash, total int) (int, error) {
 	k := total / 2
-	got, err := n.gather(ctx, root, total, k)
+	got, err := n.gather(ctx, root, total, k, nil)
 	if err != nil {
 		return 0, err
 	}

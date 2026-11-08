@@ -14,6 +14,7 @@ const (
 	tData  byte = 6
 	tHas   byte = 7 // body as GET; answered with tHasR
 	tHasR  byte = 8 // body: status u8 (0 held, 1 not held)
+	tOnion byte = 9 // fixed-size onion packet, see onion.go
 
 	hdrLen      = 1 + 8 + 32
 	maxDatagram = 1400

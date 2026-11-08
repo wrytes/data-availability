@@ -38,9 +38,13 @@ func main() {
 		mb, _ := strconv.ParseInt(env("MAX_BYTES", "268435456"), 10, 64)
 		loss, _ := strconv.ParseFloat(env("LOSS", "0"), 64)
 		rs, _ := strconv.Atoi(env("REPAIR_INTERVAL", "10"))
+		on, _ := strconv.Atoi(env("ONION", "0"))
+		od, _ := strconv.Atoi(env("ONION_DELAY_MS", "20"))
+		cv, _ := strconv.ParseFloat(env("COVER_RATE", "0"), 64)
+		hid := env("HIDDEN", "0") == "1"
 		n, err := NewNode(Config{Port: port, HTTP: env("HTTP", ":8080"), Discover: parseDiscover(env("DISCOVER", "")),
 			Replication: rep, MaxBytes: mb, Loss: loss, DataDir: env("DATA_DIR", ""), NodeName: env("NODE_NAME", ""),
-			RepairEvery: time.Duration(rs) * time.Second})
+			RepairEvery: time.Duration(rs) * time.Second, Onion: on, OnionDelay: time.Duration(od) * time.Millisecond, Cover: cv, Hidden: hid})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -54,7 +58,11 @@ func main() {
 	case "status":
 		resp, err = http.Get(base + "/status")
 	case "put":
-		resp, err = http.Post(base+"/put", "application/octet-stream", os.Stdin)
+		u := base + "/put"
+		if len(os.Args) > 2 { // da put <hidden service id>[,<id>...]
+			u += "?hidden=" + os.Args[2]
+		}
+		resp, err = http.Post(u, "application/octet-stream", os.Stdin)
 	case "get", "audit":
 		if len(os.Args) < 3 {
 			log.Fatal("manifest json required")
@@ -84,6 +92,9 @@ func main() {
 		u := base + "/" + cmd
 		if cmd == "audit" && len(os.Args) > 3 {
 			u += "?samples=" + os.Args[3]
+		}
+		if cmd == "get" && len(os.Args) > 3 && os.Args[3] == "hidden" { // fetch from hidden holders only
+			u += "?via=hidden"
 		}
 		resp, err = http.Post(u, "application/json", bytes.NewReader(raw))
 	default:

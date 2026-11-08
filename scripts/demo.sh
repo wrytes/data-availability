@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: scripts/demo.sh up | demo | big | persist | repair | down
+# Usage: scripts/demo.sh up | demo | big | persist | repair | onion | hidden | down
 set -euo pipefail
 cd "$(dirname "$0")/.."
 STACK=da
@@ -16,7 +16,7 @@ for l in sys.stdin:
     j=json.loads(l); n+=1; cp+=j["roots"].get(root,0); p+=j["repair_pushed"]; r+=j["repair_rebuilds"]
 print(f"nodes={n} copies_of_file={cp} (repair: pushed={p} erasure_rebuilds={r})")'
 }
-putfile() { client put < "$1" > /tmp/da-put.json
+putfile() { client put ${2:-} < "$1" > /tmp/da-put.json
   python3 - <<'PY'
 import json
 r=json.load(open("/tmp/da-put.json")); m=r["manifest"]
@@ -25,6 +25,17 @@ json.dump(m,open("/tmp/da-m.json","w"))
 PY
 }
 check() { client get - < /tmp/da-m.json | cmp - "$1" && echo "  OK: byte-identical" || { echo "  FAILED"; return 1; }; }
+ostats() { # get_direct get_onion relayed dropped, summed over all nodes
+  for c in $(docker ps -qf name=${STACK}_); do docker exec "$c" da status; echo; done | python3 -c '
+import sys,json
+t=[0,0,0,0]
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    j=json.loads(l)
+    for i,k in enumerate(["get_direct","get_onion","onion_relayed","onion_dropped"]): t[i]+=j[k]
+print(*t)'
+}
 wait_peers() { sleep "${1:-20}"; }
 
 case "${1:-demo}" in
@@ -61,4 +72,37 @@ repair)
   echo "== now also drop two region-A nodes"; docker service scale --detach ${STACK}_node-a=2 >/dev/null; sleep 20; echo -n "  "; stats
   echo "== get"; check /tmp/da-in.bin
   docker service scale --detach ${STACK}_node-a=4 ${STACK}_node-b=4 >/dev/null ;;
+onion)
+  head -c 300000 /dev/urandom > /tmp/da-in.bin
+  read d0 o0 r0 x0 <<< "$(ostats)"
+  echo "== put + get (client requests go through 2 relays each)"; putfile /tmp/da-in.bin; check /tmp/da-in.bin
+  read d1 o1 r1 x1 <<< "$(ostats)"
+  echo "  GET requests served directly (holder saw the requester): $((d1-d0))"
+  echo "  GET requests served over onion routes (holder saw only a relay): $((o1-o0))"
+  echo "  onion packets relayed: $((r1-r0)), dropped (bad mac / replay): $((x1-x0))" ;;
+hidden)
+  H=$(docker ps -qf name=${STACK}_hidden | head -1)
+  SID=$(docker exec "$H" da status | python3 -c 'import sys,json;print(json.load(sys.stdin)["sid"])')
+  echo "== hidden holder service id: $SID"
+  head -c 60000 /dev/urandom > /tmp/da-in.bin
+  echo "== put with the hidden holder as an extra replica (every shard goes through a rendezvous point)"
+  putfile /tmp/da-in.bin "$SID"
+  echo -n "  shards held by the hidden node: "; docker exec "$H" da status | python3 -c 'import sys,json;print(json.load(sys.stdin)["shards"])'
+  echo "== is it listed by anyone? (peer tables of all other nodes vs. the hidden node's addresses)"
+  IPS=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$H")
+  for c in $(docker ps -qf name=${STACK}_ | grep -v "^$H"); do docker exec "$c" da status; echo; done | IPS="$IPS" python3 -c '
+import sys,json,os
+ips=set(os.environ["IPS"].split()); seen=0; nodes=0
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    nodes+=1
+    for p in json.loads(l)["peer_list"]:
+        if p["addr"].rsplit(":",1)[0] in ips: seen+=1
+print(f"  hidden node addresses {sorted(ips)}: found in {seen} peer-table entries across {nodes} nodes")'
+  echo "== direct request to the hidden node (should time out)"
+  HIP=$(echo $IPS | awk '{print $1}')
+  docker exec "$(docker ps -qf name=${STACK}_bridge | head -1)" sh -c "echo test | timeout 3 nc -u -w2 $HIP 7000 || echo '  no answer'"
+  echo "== get using ONLY the hidden holder"
+  client get - hidden < /tmp/da-m.json | cmp - /tmp/da-in.bin && echo "  OK: byte-identical" ;;
 esac

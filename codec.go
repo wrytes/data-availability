@@ -18,15 +18,15 @@ import (
 )
 
 const (
-	shardSize = 640 // multiple of 64 (GF16 codec); keeps datagrams < MTU with a depth-16 proof
+	shardSize = 256 // multiple of 64 (GF16 codec); a STORE plus a reply block must fit one onion packet
 	maxLeaves = 65536
 )
 
 // segSize is the plaintext size of one segment. Each segment is its own
 // Reed-Solomon codeword with its own Merkle root, which lifts the 65 536-shard
 // limit of a single codeword: files of any size are streamed segment by segment.
-// 16 MiB (+96 B of cipher overhead) is ~52 430 shards, safely under the limit.
-var segSize = 16 << 20
+// 8 MiB minus 64 KiB (+96 B of cipher overhead) is ~65 000 shards at 256 B, just under the limit.
+var segSize = 8<<20 - 64<<10
 
 // Seg is one independently coded and committed piece of the file.
 type Seg struct {
@@ -44,11 +44,13 @@ type Manifest struct {
 	Shard    int      `json:"shard"`
 	PlainLen int64    `json:"plainlen"`
 	Segs     []Seg    `json:"segs"`
+	Hidden   []string `json:"hidden,omitempty"` // service ids of hidden holders that also hold every shard
 }
 
 type PutResult struct {
 	Manifest  Manifest `json:"manifest"`
 	Segments  int      `json:"segments"`
+	HiddenAck int      `json:"hidden_replica_acks"`
 	Shards    int      `json:"shards"`
 	Acked     int      `json:"shards_acked"`
 	Replicas  int      `json:"replica_acks"`
@@ -86,9 +88,17 @@ func (n *Node) Put(ctx context.Context, pt []byte) (*PutResult, error) {
 
 // PutReader streams r in segSize pieces; memory use is bounded by one segment.
 func (n *Node) PutReader(ctx context.Context, r io.Reader) (*PutResult, error) {
+	return n.PutReaderHidden(ctx, r, nil)
+}
+
+// PutReaderHidden additionally stores every shard at the given hidden holders.
+func (n *Node) PutReaderHidden(ctx context.Context, r io.Reader, hidden []Hash) (*PutResult, error) {
 	master := make([]byte, 32)
 	rand.Read(master)
 	res := &PutResult{Manifest: Manifest{V: 2, Key: hex.EncodeToString(master), Layers: layerNames(), Shard: shardSize}}
+	for _, h := range hidden {
+		res.Manifest.Hidden = append(res.Manifest.Hidden, hex.EncodeToString(h[:]))
+	}
 	buf := make([]byte, segSize)
 	for idx := uint32(0); ; idx++ {
 		l, err := io.ReadFull(r, buf)
@@ -100,11 +110,12 @@ func (n *Node) PutReader(ctx context.Context, r io.Reader) (*PutResult, error) {
 			break
 		}
 		sctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-		seg, st, perr := n.putSegment(sctx, master, idx, buf[:l])
+		seg, st, perr := n.putSegment(sctx, master, idx, buf[:l], hidden)
 		cancel()
 		res.Shards += st.shards
 		res.Acked += st.acked
 		res.Replicas += st.replicas
+		res.HiddenAck += st.hidden
 		res.Stored += st.replicas * shardSize
 		if perr != nil {
 			return res, fmt.Errorf("segment %d: %w", idx, perr)
@@ -120,9 +131,9 @@ func (n *Node) PutReader(ctx context.Context, r io.Reader) (*PutResult, error) {
 	return res, nil
 }
 
-type putStats struct{ shards, acked, replicas int }
+type putStats struct{ shards, acked, replicas, hidden int }
 
-func (n *Node) putSegment(ctx context.Context, master []byte, idx uint32, pt []byte) (Seg, putStats, error) {
+func (n *Node) putSegment(ctx context.Context, master []byte, idx uint32, pt []byte, hidden []Hash) (Seg, putStats, error) {
 	var st putStats
 	ct, err := seal(master, pt, idx)
 	if err != nil {
@@ -159,7 +170,22 @@ func (n *Node) putSegment(ctx context.Context, master []byte, idx uint32, pt []b
 	levels := buildTree(leaves)
 	root := levels[len(levels)-1][0]
 
-	var acked, replicas int64
+	var acked, replicas, hiddenAcks int64
+	type hf struct {
+		i   int
+		sid Hash
+	}
+	var hmu sync.Mutex
+	var failed []hf
+	storeHidden := func(i int, sid Hash) bool {
+		body := encStore(root, uint32(i), uint32(total), shards[i], proofFor(levels, i))
+		m, err := n.hiddenCall(ctx, sid, tStore, body, 3*time.Second, 3)
+		if err == nil && len(m.body) > 0 && m.body[0] == 0 {
+			atomic.AddInt64(&hiddenAcks, 1)
+			return true
+		}
+		return false
+	}
 	parallel(ctx, total, 64, func(i int) {
 		proof := proofFor(levels, i)
 		got := false
@@ -167,7 +193,7 @@ func (n *Node) putSegment(ctx context.Context, master []byte, idx uint32, pt []b
 			ok := false
 			if h.self {
 				ok = n.putLocal(root, uint32(i), uint32(total), shards[i], proof, false) == 0
-			} else if m, err := n.call(ctx, h.addr, tStore, encStore(root, uint32(i), uint32(total), shards[i], proof), 500*time.Millisecond, 4); err == nil {
+			} else if m, err := n.rpc(ctx, h, tStore, encStore(root, uint32(i), uint32(total), shards[i], proof), 500*time.Millisecond, 4); err == nil {
 				ok = len(m.body) > 0 && m.body[0] == 0
 			}
 			if ok {
@@ -178,8 +204,27 @@ func (n *Node) putSegment(ctx context.Context, master []byte, idx uint32, pt []b
 		if got {
 			atomic.AddInt64(&acked, 1)
 		}
+		for _, sid := range hidden {
+			if !storeHidden(i, sid) {
+				hmu.Lock()
+				failed = append(failed, hf{i, sid})
+				hmu.Unlock()
+			}
+		}
 	})
-	st = putStats{total, int(acked), int(replicas)}
+	// rendezvous is heavy: retry what timed out, at lower concurrency
+	for pass := 0; pass < 3 && len(failed) > 0 && ctx.Err() == nil; pass++ {
+		cur := failed
+		failed = nil
+		parallel(ctx, len(cur), 12, func(j int) {
+			if !storeHidden(cur[j].i, cur[j].sid) {
+				hmu.Lock()
+				failed = append(failed, cur[j])
+				hmu.Unlock()
+			}
+		})
+	}
+	st = putStats{total, int(acked), int(replicas), int(hiddenAcks)}
 	seg := Seg{Root: hex.EncodeToString(root[:]), K: k, CtLen: len(ct)}
 	if need := k + (total-k)/2; int(acked) < need { // not enough margin to be useful
 		return seg, st, fmt.Errorf("only %d/%d shards acknowledged (need >= %d)", acked, total, need)
@@ -189,9 +234,13 @@ func (n *Node) putSegment(ctx context.Context, master []byte, idx uint32, pt []b
 
 // fetchShard asks the closest holders (replication + spares) until one returns
 // a shard that verifies against the commitment.
-func (n *Node) fetchShard(ctx context.Context, root Hash, total, i int) ([]byte, bool) {
+func (n *Node) fetchShard(ctx context.Context, root Hash, total, i int, hidden []Hash) ([]byte, bool) {
 	key := shardKey(root, uint32(i))
-	for _, h := range n.holders(key, n.cfg.Replication+3) {
+	holders := n.holders(key, n.cfg.Replication+3)
+	if isHiddenOnly(ctx) {
+		holders = nil
+	}
+	for _, h := range holders {
 		if ctx.Err() != nil {
 			return nil, false
 		}
@@ -201,24 +250,45 @@ func (n *Node) fetchShard(ctx context.Context, root Hash, total, i int) ([]byte,
 			}
 			continue
 		}
-		m, err := n.call(ctx, h.addr, tGet, encGet(root, uint32(i)), 400*time.Millisecond, 2)
+		m, err := n.rpc(ctx, h, tGet, encGet(root, uint32(i)), 400*time.Millisecond, 2)
 		if err != nil || len(m.body) == 0 || m.body[0] != 0 {
 			continue
 		}
-		r := &rd{b: m.body[1:]}
-		cnt := r.u32()
-		data := r.take(int(r.u16()))
-		proof := r.proof()
-		if !r.bad && int(cnt) == total && verifyShard(root, uint32(i), cnt, data, proof) {
+		if data, ok := parseData(m.body, root, total, i); ok {
 			return data, true
 		}
+	}
+	for _, sid := range hidden { // hidden replicas, reached via rendezvous
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		m, err := n.hiddenCall(ctx, sid, tGet, encGet(root, uint32(i)), 3*time.Second, 2)
+		if err == nil && m.typ == tData {
+			if data, ok := parseData(m.body, root, total, i); ok {
+				return data, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func parseData(body []byte, root Hash, total, i int) ([]byte, bool) {
+	if len(body) == 0 || body[0] != 0 {
+		return nil, false
+	}
+	r := &rd{b: body[1:]}
+	cnt := r.u32()
+	data := r.take(int(r.u16()))
+	proof := r.proof()
+	if !r.bad && int(cnt) == total && verifyShard(root, uint32(i), cnt, data, proof) {
+		return data, true
 	}
 	return nil, false
 }
 
 // gather fetches random shards until k verified ones are in hand (any K of 2K
 // is enough, which is what makes loss on the way harmless).
-func (n *Node) gather(ctx context.Context, root Hash, total, k int) ([][]byte, error) {
+func (n *Node) gather(ctx context.Context, root Hash, total, k int, hidden []Hash) ([][]byte, error) {
 	got := make([][]byte, total)
 	var have int32
 	cctx, cancel := context.WithCancel(ctx)
@@ -229,7 +299,7 @@ func (n *Node) gather(ctx context.Context, root Hash, total, k int) ([][]byte, e
 			return
 		}
 		i := order[j]
-		if d, ok := n.fetchShard(cctx, root, total, i); ok {
+		if d, ok := n.fetchShard(cctx, root, total, i, hidden); ok {
 			got[i] = d
 			if int(atomic.AddInt32(&have, 1)) >= k {
 				cancel()
@@ -240,6 +310,20 @@ func (n *Node) gather(ctx context.Context, root Hash, total, k int) ([][]byte, e
 		return nil, fmt.Errorf("unavailable: only %d/%d shards retrievable (need %d)", have, total, k)
 	}
 	return got, nil
+}
+
+func (mf Manifest) hiddenIDs() ([]Hash, error) {
+	var out []Hash
+	for _, s := range mf.Hidden {
+		b, err := hex.DecodeString(s)
+		if err != nil || len(b) != 32 {
+			return nil, errors.New("bad manifest: hidden id")
+		}
+		var h Hash
+		copy(h[:], b)
+		out = append(out, h)
+	}
+	return out, nil
 }
 
 func (mf Manifest) check() ([]Hash, error) {
@@ -267,10 +351,14 @@ func (n *Node) GetTo(ctx context.Context, mf Manifest, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	hid, err := mf.hiddenIDs()
+	if err != nil {
+		return err
+	}
 	var written int64
 	for i, sg := range mf.Segs {
 		sctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-		pt, err := n.getSegment(sctx, master, uint32(i), roots[i], sg)
+		pt, err := n.getSegment(sctx, master, uint32(i), roots[i], sg, hid)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("segment %d/%d: %w", i+1, len(mf.Segs), err)
@@ -286,8 +374,8 @@ func (n *Node) GetTo(ctx context.Context, mf Manifest, w io.Writer) error {
 	return nil
 }
 
-func (n *Node) getSegment(ctx context.Context, master []byte, idx uint32, root Hash, sg Seg) ([]byte, error) {
-	got, err := n.gather(ctx, root, 2*sg.K, sg.K)
+func (n *Node) getSegment(ctx context.Context, master []byte, idx uint32, root Hash, sg Seg, hidden []Hash) ([]byte, error) {
+	got, err := n.gather(ctx, root, 2*sg.K, sg.K, hidden)
 	if err != nil {
 		return nil, err
 	}
@@ -335,6 +423,10 @@ func (n *Node) Audit(ctx context.Context, mf Manifest, s int) (*AuditResult, err
 	if err != nil {
 		return nil, err
 	}
+	hid, err := mf.hiddenIDs()
+	if err != nil {
+		return nil, err
+	}
 	r := &AuditResult{Segments: len(mf.Segs), Fraction: 1, Recoverable: true}
 	allClean := true
 	for si, sg := range mf.Segs {
@@ -347,7 +439,7 @@ func (n *Node) Audit(ctx context.Context, mf Manifest, s int) (*AuditResult, err
 		idx := mrand.Perm(total)[:ss]
 		var ok int32
 		parallel(sctx, ss, 32, func(j int) {
-			if _, good := n.fetchShard(sctx, roots[si], total, idx[j]); good {
+			if _, good := n.fetchShard(sctx, roots[si], total, idx[j], hid); good {
 				atomic.AddInt32(&ok, 1)
 			}
 		})

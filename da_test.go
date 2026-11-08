@@ -50,6 +50,8 @@ type opts struct {
 	loss   float64
 	data   bool
 	repair time.Duration
+	onion  int
+	delay  time.Duration
 }
 
 func mk(t *testing.T, i int, o opts, dirs []string) *Node {
@@ -57,7 +59,7 @@ func mk(t *testing.T, i int, o opts, dirs []string) *Node {
 	if i > 0 {
 		d = []string{"127.0.0.1:17000"}
 	}
-	cfg := Config{Port: 17000 + i, Discover: d, Replication: 2, MaxBytes: 1 << 28, Loss: o.loss, RepairEvery: o.repair}
+	cfg := Config{Port: 17000 + i, Discover: d, Replication: 2, MaxBytes: 1 << 28, Loss: o.loss, RepairEvery: o.repair, Onion: o.onion, OnionDelay: o.delay}
 	if o.data {
 		cfg.DataDir, cfg.NodeName = dirs[i], "n"
 	}
@@ -69,6 +71,10 @@ func mk(t *testing.T, i int, o opts, dirs []string) *Node {
 }
 
 func cluster(t *testing.T, cnt int, o opts) ([]*Node, []string) {
+	return clusterWait(t, cnt, o, 6*time.Second)
+}
+
+func clusterWait(t *testing.T, cnt int, o opts, wait time.Duration) ([]*Node, []string) {
 	var dirs []string
 	for i := 0; i < cnt; i++ {
 		dirs = append(dirs, t.TempDir())
@@ -77,7 +83,7 @@ func cluster(t *testing.T, cnt int, o opts) ([]*Node, []string) {
 	for i := 0; i < cnt; i++ {
 		ns = append(ns, mk(t, i, o, dirs))
 	}
-	time.Sleep(6 * time.Second)
+	time.Sleep(wait)
 	return ns, dirs
 }
 
@@ -91,7 +97,7 @@ func TestEndToEnd(t *testing.T) {
 	ns, _ := cluster(t, 10, opts{loss: 0.1}) // 10% packet loss
 	defer closeAll(ns)
 	ctx := context.Background()
-	for _, size := range []int{10, 200_000, 1_500_000} { // 1.5MB => >256 shards => GF16 path
+	for _, size := range []int{10, 200_000, 600_000} { // many hundreds of shards => GF16 path
 		pt := make([]byte, size)
 		rand.Read(pt)
 		res, err := ns[0].Put(ctx, pt)
