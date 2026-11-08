@@ -66,6 +66,18 @@ The introduction point knows neither side's address; the rendezvous point knows 
 Limits: hidden replicas are not repaired, a client can only use introduction points it has as direct peers, directories are found by "closest in my view" (clients also try other peers),
 and one request costs about three onion round trips, so this suits modest data volumes.
 
+## Attached nodes behind NAT (`ATTACHED=1`)
+
+A node with no reachable port dials out to a few public guards (`GUARDS`, default 3) and never appears in peer tables or gossip.
+- Each PING to a guard carries a 6-byte link id (`sha256(linkSecret||guardAddr)[:6]`); the guard maps id -> current source address.
+- Keepalive pings every 2s hold the router's NAT row open and refresh the guard's mapping, so a changed external port heals itself.
+- Reply blocks end in a link record (`recRelayLink`): the last relay delivers by link id, never by address.
+- `NAT_FILTER=1` simulates a restrictive NAT (drops inbound from addresses not sent to within 30s); `rebind()` simulates a mapping change.
+- `HIDDEN=1` implies `ATTACHED=1`; onion is forced to at least 2 relays.
+- Demo: `scripts/demo.sh edge`. Test: `TestAttachedBehindNAT`.
+
+Limits: NAT is simulated, not real; no hole punching; source addresses are spoofable (no link-level auth); networks that block UDP still need a TCP/TLS fallback.
+
 ## Findings / insights
 - **Layers**: stacking ciphers is cheap here (AEAD, ~40 B overhead per layer) and protects against a break of one primitive,
   but only if keys are independent (they are). It does *not* add security against a key leak, nor hide size.
