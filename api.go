@@ -1,16 +1,21 @@
 package main
 
 import (
-	"context"
 	"encoding/hex"
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
 )
 
-const maxBody = 24 << 20
+type lazyWriter struct {
+	w       http.ResponseWriter
+	started bool
+}
+
+func (l *lazyWriter) Write(b []byte) (int, error) { l.started = true; return l.w.Write(b) }
+
+const maxFile = int64(8) << 30 // sanity cap per upload; storage is bounded by node capacity
 
 func (n *Node) status() map[string]any {
 	ps := n.peerList()
@@ -18,10 +23,14 @@ func (n *Node) status() map[string]any {
 	for _, p := range ps {
 		pl = append(pl, map[string]string{"id": hex.EncodeToString(p.id[:4]), "addr": p.addr.String()})
 	}
-	n.smu.RLock()
-	defer n.smu.RUnlock()
+	shards, bytes := n.store.stats()
+	roots := map[string]int{}
+	for r, ri := range n.store.roots() {
+		roots[hex.EncodeToString(r[:4])] = len(ri.leaves)
+	}
 	return map[string]any{"id": hex.EncodeToString(n.id[:4]), "peers": len(ps), "peer_list": pl,
-		"shards": len(n.store), "bytes": n.bytes, "replication": n.cfg.Replication, "loss": n.cfg.Loss}
+		"shards": shards, "bytes": bytes, "replication": n.cfg.Replication, "loss": n.cfg.Loss,
+		"persistent": n.cfg.DataDir != "", "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
 }
 
 func (n *Node) serveHTTP() error {
@@ -33,14 +42,7 @@ func (n *Node) serveHTTP() error {
 	}
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) { wj(w, 200, n.status()) })
 	mux.HandleFunc("POST /put", func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
-		if err != nil {
-			wj(w, 413, map[string]string{"error": err.Error()})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-		defer cancel()
-		res, err := n.Put(ctx, body)
+		res, err := n.PutReader(r.Context(), http.MaxBytesReader(w, r.Body, maxFile))
 		if err != nil {
 			wj(w, 502, map[string]any{"error": err.Error(), "result": res})
 			return
@@ -60,15 +62,16 @@ func (n *Node) serveHTTP() error {
 		if !ok {
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-		defer cancel()
-		b, err := n.Get(ctx, mf)
-		if err != nil {
-			wj(w, 502, map[string]string{"error": err.Error()})
-			return
-		}
 		w.Header().Set("content-type", "application/octet-stream")
-		w.Write(b)
+		sw := &lazyWriter{w: w}
+		if err := n.GetTo(r.Context(), mf, sw); err != nil {
+			if !sw.started { // nothing sent yet: report properly
+				w.Header().Set("content-type", "application/json")
+				wj(w, 502, map[string]string{"error": err.Error()})
+				return
+			}
+			panic(http.ErrAbortHandler) // mid-stream failure: cut the connection so the client sees an error
+		}
 	})
 	mux.HandleFunc("POST /audit", func(w http.ResponseWriter, r *http.Request) {
 		mf, ok := manifest(w, r)
@@ -79,9 +82,7 @@ func (n *Node) serveHTTP() error {
 		if s <= 0 {
 			s = 30
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-		res, err := n.Audit(ctx, mf, s)
+		res, err := n.Audit(r.Context(), mf, s)
 		if err != nil {
 			wj(w, 400, map[string]string{"error": err.Error()})
 			return

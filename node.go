@@ -5,14 +5,18 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"log"
 	"math/big"
 	mrand "math/rand"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,19 +26,16 @@ type Config struct {
 	Discover    []string // host or host:port; resolved via DNS (swarm: tasks.<svc>)
 	Replication int
 	MaxBytes    int64
-	Loss        float64 // simulated inbound packet loss, 0..1
+	Loss        float64       // simulated inbound packet loss, 0..1
+	DataDir     string        // empty = in-memory only
+	NodeName    string        // stable per-replica subdirectory under DataDir
+	RepairEvery time.Duration // 0 disables repair
 }
 
 type peer struct {
 	id   Hash
 	addr netip.AddrPort
 	seen time.Time
-}
-
-type stored struct {
-	n     uint32
-	data  []byte
-	proof []Hash
 }
 
 type Node struct {
@@ -47,9 +48,12 @@ type Node struct {
 	tried map[netip.AddrPort]time.Time
 	pend  map[uint64]chan msg
 
-	smu   sync.RWMutex
-	store map[Hash]stored
-	bytes int64
+	store *shardStore
+
+	repMu    sync.Mutex
+	cool     map[Hash]time.Time
+	pushed   atomic.Int64
+	rebuilds atomic.Int64
 
 	done chan struct{}
 	once sync.Once
@@ -60,12 +64,53 @@ func NewNode(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	dir := ""
+	if cfg.DataDir != "" {
+		name := cfg.NodeName
+		if name == "" {
+			name = "node"
+		}
+		dir = filepath.Join(cfg.DataDir, name)
+	}
+	st, err := openStore(dir)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
 	n := &Node{cfg: cfg, conn: c, peers: map[Hash]*peer{}, tried: map[netip.AddrPort]time.Time{},
-		pend: map[uint64]chan msg{}, store: map[Hash]stored{}, done: make(chan struct{})}
-	rand.Read(n.id[:])
+		pend: map[uint64]chan msg{}, store: st, cool: map[Hash]time.Time{}, done: make(chan struct{})}
+	if err := n.loadID(dir); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if cnt, b := st.stats(); cnt > 0 {
+		log.Printf("restored %d shards (%d bytes) from %s", cnt, b, dir)
+	}
 	go n.recvLoop()
 	go n.maintainLoop()
+	if cfg.RepairEvery > 0 {
+		go n.repairLoop()
+	}
 	return n, nil
+}
+
+// loadID keeps the node ID stable across restarts, so placement stays valid.
+func (n *Node) loadID(dir string) error {
+	if dir == "" {
+		_, err := rand.Read(n.id[:])
+		return err
+	}
+	p := filepath.Join(dir, "node.id")
+	if b, err := os.ReadFile(p); err == nil {
+		if len(b) == 32 {
+			copy(n.id[:], b)
+			return nil
+		}
+	}
+	if _, err := rand.Read(n.id[:]); err != nil {
+		return err
+	}
+	return os.WriteFile(p, n.id[:], 0o600)
 }
 
 func (n *Node) Close() { n.once.Do(func() { close(n.done); n.conn.Close() }) }
@@ -121,7 +166,7 @@ func (n *Node) handle(m msg, src netip.AddrPort) {
 	case tPong:
 		n.learn(m.body)
 		n.deliver(m)
-	case tAck, tData:
+	case tAck, tData, tHasR:
 		n.deliver(m)
 	case tStore:
 		r := &rd{b: m.body}
@@ -136,30 +181,28 @@ func (n *Node) handle(m msg, src netip.AddrPort) {
 		if r.bad {
 			return
 		}
-		n.smu.RLock()
-		s, ok := n.store[shardKey(root, leaf)]
-		n.smu.RUnlock()
+		s, ok := n.store.get(root, leaf)
 		n.send(src, msg{typ: tData, id: m.id, body: encData(ok, s.n, s.data, s.proof)})
+	case tHas:
+		r := &rd{b: m.body}
+		root, leaf := r.hash(), r.u32()
+		if r.bad {
+			return
+		}
+		st := byte(1)
+		if n.store.has(root, leaf) {
+			st = 0
+		}
+		n.send(src, msg{typ: tHasR, id: m.id, body: []byte{st}})
 	}
 }
 
-// putLocal returns 0 ok, 1 invalid, 2 full.
+// putLocal returns 0 ok, 1 invalid, 2 full, 3 io error.
 func (n *Node) putLocal(root Hash, leaf, cnt uint32, data []byte, proof []Hash, bad bool) byte {
 	if bad || len(data) == 0 || !verifyShard(root, leaf, cnt, data, proof) {
 		return 1
 	}
-	k := shardKey(root, leaf)
-	n.smu.Lock()
-	defer n.smu.Unlock()
-	if _, ok := n.store[k]; ok {
-		return 0
-	}
-	if n.bytes+int64(len(data)) > n.cfg.MaxBytes {
-		return 2
-	}
-	n.store[k] = stored{cnt, data, proof}
-	n.bytes += int64(len(data))
-	return 0
+	return n.store.put(root, leaf, cnt, data, proof, n.cfg.MaxBytes)
 }
 
 func (n *Node) deliver(m msg) {
