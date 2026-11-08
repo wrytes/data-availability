@@ -15,7 +15,7 @@ func TestHiddenHolder(t *testing.T) {
 	defer closeAll(ns)
 
 	// the hidden node only knows four guards; nothing else in the network is told about it
-	h, err := NewNode(Config{Port: 17020, Replication: 2, MaxBytes: 1 << 28, Hidden: true, OnionDelay: 5 * time.Millisecond,
+	h, err := NewNode(Config{Port: 17020, Replication: 2, MaxBytes: 1 << 28, Hidden: true, NATFilter: true, Guards: 4, OnionDelay: 5 * time.Millisecond,
 		DataDir: t.TempDir(), NodeName: "h",
 		Discover: []string{"127.0.0.1:17001", "127.0.0.1:17002", "127.0.0.1:17003", "127.0.0.1:17004"}})
 	if err != nil {

@@ -36,6 +36,9 @@ type Config struct {
 	OnionDelay time.Duration // max random delay a relay adds per hop
 	Cover      float64       // dummy onion packets per second
 	Hidden     bool          // hidden holder: never listed, ignores direct requests, reachable only via rendezvous
+	Attached   bool          // behind NAT: only dials out to a few guards, keeps those links alive, is never listed
+	Guards     int           // how many guards an attached node keeps (default 3)
+	NATFilter  bool          // test/demo: drop inbound packets from addresses we have not sent to (stateful NAT/firewall)
 }
 
 // nbr is what a peer told us about one of its own peers: the key and the
@@ -68,12 +71,17 @@ func idOf(pub []byte) Hash {
 	return o
 }
 
+type linkEntry struct {
+	addr netip.AddrPort
+	seen time.Time
+}
+
 type Node struct {
 	cfg  Config
 	id   Hash
 	priv *ecdh.PrivateKey
 	pub  [32]byte
-	conn *net.UDPConn
+	conn atomic.Pointer[net.UDPConn]
 
 	mu    sync.RWMutex
 	peers map[Hash]*peer
@@ -81,6 +89,13 @@ type Node struct {
 	pend  map[uint64]chan msg
 
 	store *shardStore
+
+	linkMu     sync.Mutex
+	links      map[[6]byte]linkEntry // guard side: attached clients by link id
+	linkSecret [16]byte
+	outMu      sync.Mutex
+	out        map[netip.AddrPort]time.Time // NATFilter: who we have sent to
+	natDropped atomic.Int64
 
 	hsMu    sync.Mutex
 	hs      hsState
@@ -123,9 +138,22 @@ func NewNode(cfg Config) (*Node, error) {
 		c.Close()
 		return nil, err
 	}
-	n := &Node{cfg: cfg, conn: c, peers: map[Hash]*peer{}, tried: map[netip.AddrPort]time.Time{},
+	if cfg.Hidden {
+		cfg.Attached = true
+	}
+	if cfg.Attached {
+		if cfg.Guards <= 0 {
+			cfg.Guards = 3
+		}
+		if cfg.Onion < 2 {
+			cfg.Onion = 2 // an attached node has no direct path to anyone but its guards
+		}
+	}
+	n := &Node{cfg: cfg, links: map[[6]byte]linkEntry{}, out: map[netip.AddrPort]time.Time{}, peers: map[Hash]*peer{}, tried: map[netip.AddrPort]time.Time{},
 		pend: map[uint64]chan msg{}, store: st, cool: map[Hash]time.Time{}, cursor: map[Hash]int{}, done: make(chan struct{}),
 		hs: newHsState(), private: map[Hash]bool{}, surbs: map[uint64]*surbEntry{}, seen: map[[16]byte]time.Time{}}
+	n.conn.Store(c)
+	rand.Read(n.linkSecret[:])
 	if err := n.loadKey(dir); err != nil {
 		c.Close()
 		return nil, err
@@ -133,7 +161,7 @@ func NewNode(cfg Config) (*Node, error) {
 	if cnt, b := st.stats(); cnt > 0 {
 		log.Printf("restored %d shards (%d bytes) from %s", cnt, b, dir)
 	}
-	go n.recvLoop()
+	go n.recvLoop(c)
 	go n.maintainLoop()
 	if cfg.RepairEvery > 0 {
 		go n.repairLoop()
@@ -184,7 +212,44 @@ func (n *Node) setKey(k *ecdh.PrivateKey) {
 	n.id = idOf(n.pub[:])
 }
 
-func (n *Node) Close() { n.once.Do(func() { close(n.done); n.conn.Close() }) }
+func (n *Node) Close() {
+	n.once.Do(func() {
+		close(n.done)
+		if c := n.conn.Load(); c != nil {
+			c.Close()
+		}
+	})
+}
+
+// rebind moves the node to a new UDP port, as a NAT does when it drops and
+// recreates a mapping. Used by tests.
+func (n *Node) rebind() error {
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil {
+		return err
+	}
+	old := n.conn.Swap(c)
+	go n.recvLoop(c)
+	if old != nil {
+		old.Close()
+	}
+	return nil
+}
+
+// linkFor is the id under which we ask a guard to remember our current address.
+// It is stable per guard, so reply blocks stay valid when our NAT mapping moves.
+func (n *Node) linkFor(guard netip.AddrPort) (id [6]byte) {
+	h := sha256.Sum256(append(n.linkSecret[:], guard.String()...))
+	copy(id[:], h[:6])
+	return
+}
+
+func (n *Node) linkAddr(id [6]byte) (netip.AddrPort, bool) {
+	n.linkMu.Lock()
+	defer n.linkMu.Unlock()
+	l, ok := n.links[id]
+	return l.addr, ok
+}
 
 func (n *Node) send(to netip.AddrPort, m msg) {
 	m.from = n.id
@@ -192,20 +257,25 @@ func (n *Node) send(to netip.AddrPort, m msg) {
 	if len(b) > maxDatagram {
 		return
 	}
-	n.conn.WriteToUDPAddrPort(b, to)
+	if n.cfg.NATFilter {
+		n.outMu.Lock()
+		n.out[to] = time.Now()
+		n.outMu.Unlock()
+	}
+	if c := n.conn.Load(); c != nil {
+		c.WriteToUDPAddrPort(b, to)
+	}
 }
 
-func (n *Node) recvLoop() {
+func (n *Node) recvLoop(c *net.UDPConn) {
 	buf := make([]byte, 2048)
 	for {
-		l, src, err := n.conn.ReadFromUDPAddrPort(buf)
+		l, src, err := c.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			select {
-			case <-n.done:
+			if errors.Is(err, net.ErrClosed) {
 				return
-			default:
-				continue
 			}
+			continue
 		}
 		if n.cfg.Loss > 0 && mrand.Float64() < n.cfg.Loss {
 			continue
@@ -215,8 +285,26 @@ func (n *Node) recvLoop() {
 			continue
 		}
 		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
+		if n.cfg.NATFilter { // a stateful NAT only lets replies from addresses we contacted
+			n.outMu.Lock()
+			t, ok := n.out[src]
+			n.outMu.Unlock()
+			if !ok || time.Since(t) > 30*time.Second {
+				n.natDropped.Add(1)
+				continue
+			}
+		}
 		if m.typ == tPing && len(m.body) > 32 && m.body[32]&1 != 0 {
-			n.markPrivate(m.from) // hidden node: answer so it learns its address, never list it
+			n.markPrivate(m.from)                       // attached/hidden node: answer so it learns its address, never list it
+			if m.body[32]&2 != 0 && len(m.body) >= 39 { // and remember where its link currently points
+				var id [6]byte
+				copy(id[:], m.body[33:39])
+				n.linkMu.Lock()
+				if len(n.links) < 8192 {
+					n.links[id] = linkEntry{src, time.Now()}
+				}
+				n.linkMu.Unlock()
+			}
 		} else if m.typ != tOnion && !n.isPrivate(m.from) {
 			n.upsert(m.from, src)
 		}
@@ -244,11 +332,14 @@ func (n *Node) upsert(id Hash, a netip.AddrPort) {
 		p.addr, p.seen = a, time.Now()
 		return
 	}
+	if n.cfg.Attached && len(n.peers) >= n.cfg.Guards {
+		return // an attached node keeps a handful of guards and nobody else
+	}
 	n.peers[id] = &peer{id: id, addr: a, seen: time.Now(), nbrs: map[Hash]nbr{}}
 }
 
 func (n *Node) handle(m msg, src netip.AddrPort) {
-	if n.cfg.Hidden && (m.typ == tPing || m.typ == tStore || m.typ == tGet || m.typ == tHas) {
+	if (n.cfg.Hidden || n.cfg.Attached) && (m.typ == tPing || m.typ == tStore || m.typ == tGet || m.typ == tHas) {
 		return // a hidden node never answers on the open network
 	}
 	switch m.typ {
@@ -400,8 +491,10 @@ func (n *Node) gossipBody() []byte {
 
 func (n *Node) sendPing(to netip.AddrPort) {
 	body := append([]byte{}, n.pub[:]...)
-	if n.cfg.Hidden {
-		body = append(body, 1) // private: do not list or gossip me
+	if n.cfg.Attached {
+		l := n.linkFor(to)
+		body = append(body, 1|2) // private: do not list or gossip me; keep a link for me
+		body = append(body, l[:]...)
 	}
 	n.send(to, msg{typ: tPing, id: mrand.Uint64(), body: body})
 }
@@ -442,7 +535,7 @@ func (n *Node) learn(from Hash, me netip.AddrPort, body []byte) {
 				break
 			}
 		}
-		if !known && !n.cfg.Hidden && (!seen || time.Since(t) > 10*time.Second) {
+		if !known && !n.cfg.Attached && (!seen || time.Since(t) > 10*time.Second) {
 			n.tried[ap] = time.Now()
 			n.mu.Unlock()
 			n.sendPing(ap)
@@ -498,12 +591,20 @@ func (n *Node) maintainLoop() {
 		n.mu.Unlock()
 		n.pruneOnion()
 
-		for _, a := range n.resolve() {
-			n.sendPing(a)
-		}
 		ps := n.peerList()
+		if !n.cfg.Attached {
+			for _, a := range n.resolve() {
+				n.sendPing(a)
+			}
+		} else if need := n.cfg.Guards - len(ps); need > 0 { // attached: contact only as many candidates as guards missing
+			cands := n.resolve()
+			mrand.Shuffle(len(cands), func(i, j int) { cands[i], cands[j] = cands[j], cands[i] })
+			for i := 0; i < len(cands) && i < need; i++ {
+				n.sendPing(cands[i])
+			}
+		}
 		mrand.Shuffle(len(ps), func(i, j int) { ps[i], ps[j] = ps[j], ps[i] })
-		for i := 0; i < len(ps) && i < 4; i++ {
+		for i := 0; i < len(ps) && (i < 4 || n.cfg.Attached); i++ { // keepalives hold the NAT mapping open
 			n.sendPing(ps[i].addr)
 		}
 		select {
@@ -535,9 +636,26 @@ type target struct {
 }
 
 func (n *Node) holders(key Hash, r int) []target {
-	ts := []target{{id: n.id, self: true}}
+	var ts []target
+	if !n.cfg.Attached { // an attached node stores nothing and is not a holder
+		ts = append(ts, target{id: n.id, self: true})
+	}
+	seen := map[Hash]bool{}
 	for _, p := range n.peerList() {
 		ts = append(ts, target{id: p.id, addr: p.addr})
+		seen[p.id] = true
+	}
+	if n.cfg.Attached { // placement still has to see the whole public network: take it from the guards' gossip
+		n.mu.RLock()
+		for _, p := range n.peers {
+			for id, nb := range p.nbrs {
+				if !seen[id] && id != n.id {
+					seen[id] = true
+					ts = append(ts, target{id: id, addr: nb.addr})
+				}
+			}
+		}
+		n.mu.RUnlock()
 	}
 	sort.Slice(ts, func(i, j int) bool {
 		for b := 0; b < 32; b++ {

@@ -43,8 +43,20 @@ func (n *Node) handleOnion(m msg, src netip.AddrPort) {
 	}
 	piDec(&pl.keys, delta)
 	switch pl.rec[0] {
-	case recRelay:
-		next := getAddr(pl.rec[1:7])
+	case recRelay, recRelayLink:
+		var next netip.AddrPort
+		if pl.rec[0] == recRelayLink { // an attached client: find it by its link
+			var id [6]byte
+			copy(id[:], pl.rec[1:7])
+			a, ok := n.linkAddr(id)
+			if !ok {
+				n.dropped.Add(1)
+				return
+			}
+			next = a
+		} else {
+			next = getAddr(pl.rec[1:7])
+		}
 		n.relayed.Add(1)
 		pkt := encodeOnion(pl.next, delta)
 		go func() {
@@ -205,9 +217,9 @@ func (n *Node) pickFwd(dest Hash) ([]hop, bool) {
 	}
 	c := cs[mrand.Intn(len(cs))]
 	return []hop{
-		{c.r0.pub, c.r0.addr},
-		{c.r1.pub, c.r0.nbrs[c.r1.id].addr},
-		{dpub, c.r1.nbrs[dest].addr},
+		{pub: c.r0.pub, addr: c.r0.addr},
+		{pub: c.r1.pub, addr: c.r0.nbrs[c.r1.id].addr},
+		{pub: dpub, addr: c.r1.nbrs[dest].addr},
 	}, true
 }
 
@@ -225,40 +237,51 @@ func (n *Node) pubOfLocked(id Hash) ([32]byte, bool) {
 
 // pickBack draws a return path [relay, relay, me] that the destination can
 // enter: the first relay must be a neighbour of dest, and the second must know
-// how to reach us.
+// how to reach us (by the address it sees us at, or, for attached clients
+// behind NAT, by the link we keep open to it).
 func (n *Node) pickBack(dest Hash) ([]hop, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	d := n.peers[dest]
-	if d == nil {
-		return nil, false
-	}
 	type cand struct {
 		r0, r1 *peer
-		a0     nbr
+		a0     netip.AddrPort
 	}
 	var cs []cand
-	for id0, a0 := range d.nbrs {
-		r0 := n.peers[id0]
-		if r0 == nil || !r0.hasPub || id0 == dest {
-			continue
-		}
+	add := func(r0 *peer, a0 netip.AddrPort) {
 		for id1 := range r0.nbrs {
 			r1 := n.peers[id1]
-			if r1 == nil || !r1.hasPub || id1 == dest || id1 == id0 || !r1.me.IsValid() {
+			if r1 == nil || !r1.hasPub || id1 == dest || id1 == r0.id || (!n.cfg.Attached && !r1.me.IsValid()) {
 				continue
 			}
 			cs = append(cs, cand{r0, r1, a0})
+		}
+	}
+	if d := n.peers[dest]; d != nil {
+		for id0, a0 := range d.nbrs { // precise: first relay as the destination itself sees it
+			if r0 := n.peers[id0]; r0 != nil && r0.hasPub && id0 != dest {
+				add(r0, a0.addr)
+			}
+		}
+	} else { // destination is not our direct peer: use relays that list it as a neighbour
+		for _, r0 := range n.peers {
+			if _, ok := r0.nbrs[dest]; ok && r0.hasPub && r0.id != dest {
+				add(r0, r0.addr)
+			}
 		}
 	}
 	if len(cs) == 0 {
 		return nil, false
 	}
 	c := cs[mrand.Intn(len(cs))]
+	last := hop{pub: n.pub, addr: c.r1.me}
+	if n.cfg.Attached {
+		l := n.linkFor(c.r1.addr)
+		last = hop{pub: n.pub, link: &l}
+	}
 	return []hop{
-		{c.r0.pub, c.a0.addr},
-		{c.r1.pub, c.r0.nbrs[c.r1.id].addr},
-		{n.pub, c.r1.me},
+		{pub: c.r0.pub, addr: c.a0},
+		{pub: c.r1.pub, addr: c.r0.nbrs[c.r1.id].addr},
+		last,
 	}, true
 }
 
@@ -417,4 +440,18 @@ func (n *Node) pruneOnion() {
 			delete(n.surbs, id)
 		}
 	}
+	n.linkMu.Lock()
+	for id, l := range n.links {
+		if now.Sub(l.seen) > 30*time.Second {
+			delete(n.links, id)
+		}
+	}
+	n.linkMu.Unlock()
+	n.outMu.Lock()
+	for a, t := range n.out {
+		if now.Sub(t) > time.Minute {
+			delete(n.out, a)
+		}
+	}
+	n.outMu.Unlock()
 }
