@@ -42,9 +42,10 @@ const (
 	surbLen  = 6 + onionHdr + 16
 	zeroLen  = 8 // integrity prefix inside the payload
 
-	recRelay   = 1
-	recDeliver = 2
-	recSurb    = 3
+	recRelay     = 1
+	recDeliver   = 2
+	recSurb      = 3
+	recRelayLink = 5 // like recRelay, but the next hop is an attached client named by a link id, not an address
 
 	kReq   = 1
 	kReply = 2
@@ -55,6 +56,7 @@ const (
 type hop struct {
 	pub  [32]byte
 	addr netip.AddrPort // where the previous hop sends to reach this one
+	link *[6]byte       // or: the previous hop holds a link with this id (attached clients behind NAT)
 }
 
 type hopKeys struct {
@@ -210,8 +212,13 @@ func buildHeader(path []hop, last []byte) (onionHeader, []hopKeys, error) {
 	gamma := macOf(&keys[onionH-1].mac, eph[onionH-1][:], beta)
 	for i := onionH - 2; i >= 0; i-- {
 		nb := make([]byte, onionB)
-		nb[0] = recRelay
-		putAddr(nb[1:7], path[i+1].addr)
+		if l := path[i+1].link; l != nil {
+			nb[0] = recRelayLink
+			copy(nb[1:7], l[:])
+		} else {
+			nb[0] = recRelay
+			putAddr(nb[1:7], path[i+1].addr)
+		}
 		copy(nb[7:39], eph[i+1][:])
 		copy(nb[39:55], gamma[:])
 		copy(nb[onionR:], beta[:onionB-onionR])

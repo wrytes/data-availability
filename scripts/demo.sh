@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: scripts/demo.sh up | demo | big | persist | repair | onion | hidden | down
+# Usage: scripts/demo.sh up | demo | big | persist | repair | onion | hidden | edge | down
 set -euo pipefail
 cd "$(dirname "$0")/.."
 STACK=da
@@ -43,7 +43,7 @@ up)
   docker build -t da:dev .
   docker stack deploy --resolve-image never -c stack.yml $STACK
   # same tag, new image content: force a rollout so swarm replaces the containers
-  for s in node-a node-b bridge; do docker service update --force --detach ${STACK}_$s >/dev/null; done
+  for s in node-a node-b bridge hidden edge; do docker service update --force --detach ${STACK}_$s >/dev/null 2>&1 || true; done
   echo "waiting for rollout + gossip..."; sleep 75; docker service ls --filter name=${STACK}_ --format '{{.Name}} {{.Replicas}}'; stats ;;
 down) docker stack rm $STACK ;;
 demo)
@@ -105,4 +105,28 @@ print(f"  hidden node addresses {sorted(ips)}: found in {seen} peer-table entrie
   docker exec "$(docker ps -qf name=${STACK}_bridge | head -1)" sh -c "echo test | timeout 3 nc -u -w2 $HIP 7000 || echo '  no answer'"
   echo "== get using ONLY the hidden holder"
   client get - hidden < /tmp/da-m.json | cmp - /tmp/da-in.bin && echo "  OK: byte-identical" ;;
+edge)
+  E=$(docker ps -qf name=${STACK}_edge | head -1)
+  ec() { docker exec -i "$E" da "$@"; }
+  echo "== the attached client (behind a simulated NAT)"
+  ec status | python3 -c 'import sys,json;j=json.load(sys.stdin);print("  guards:",[p["addr"] for p in j["peer_list"]],"| dropped by NAT filter so far:",j["nat_dropped"])'
+  head -c 100000 /dev/urandom > /tmp/da-in.bin
+  echo "== put + get through its three guards only"
+  ec put < /tmp/da-in.bin > /tmp/da-put.json
+  python3 -c 'import json;r=json.load(open("/tmp/da-put.json"));json.dump(r["manifest"],open("/tmp/da-m.json","w"));print("  stored",r["shards"],"shards,",r["replica_acks"],"replica acks")'
+  ec get - < /tmp/da-m.json | cmp - /tmp/da-in.bin && echo "  OK: byte-identical (read by the edge node)"
+  echo "== a public node reads what the attached node stored"
+  check /tmp/da-in.bin
+  echo "== is the attached node visible?"
+  EIPS=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$E")
+  for c in $(docker ps -qf name=${STACK}_ | grep -v "^$E"); do docker exec "$c" da status; echo; done | EIPS="$EIPS" python3 -c '
+import sys,json,os
+ips=set(os.environ["EIPS"].split()); seen=0; links=0; nodes=0
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    j=json.loads(l); nodes+=1; links+=j["links"]
+    seen+=sum(1 for p in j["peer_list"] if p["addr"].rsplit(":",1)[0] in ips)
+print(f"  listed in {seen} peer tables of {nodes} nodes; guards hold {links} links to it")'
+  ec status | python3 -c 'import sys,json;print("  packets the NAT filter dropped during all this:",json.load(sys.stdin)["nat_dropped"])' ;;
 esac

@@ -51,6 +51,19 @@ services:
       DISCOVER: tasks.bridge,tasks.node-b
     networks: [region-b]
     deploy: { replicas: 1 }
+  # An attached client, as if behind a home router: it dials out to 3 guards only, keeps those links
+  # alive, is never listed or gossiped, and NAT_FILTER drops any packet from an address it has not
+  # contacted first (a stateful NAT / firewall). Nothing needs to be forwarded or proxied for it.
+  edge:
+    <<: *node
+    environment:
+      <<: *env
+      ATTACHED: "1"
+      NAT_FILTER: "1"
+      COVER_RATE: "0"
+      DISCOVER: tasks.bridge,tasks.node-a
+    networks: [region-a]
+    deploy: { replicas: 1 }
 
 volumes:
   da-data: {}

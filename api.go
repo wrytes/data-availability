@@ -31,7 +31,7 @@ func (n *Node) status() map[string]any {
 	}
 	return map[string]any{"id": hex.EncodeToString(n.id[:4]), "peers": len(ps), "peer_list": pl,
 		"shards": shards, "bytes": bytes, "replication": n.cfg.Replication, "loss": n.cfg.Loss,
-		"persistent": n.cfg.DataDir != "", "hidden": n.cfg.Hidden, "sid": n.hexSid(), "onion": n.cfg.Onion, "onion_relayed": n.relayed.Load(), "onion_delivered": n.delivered.Load(), "onion_dropped": n.dropped.Load(), "get_direct": n.getDirect.Load(), "get_onion": n.getOnion.Load(), "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
+		"persistent": n.cfg.DataDir != "", "attached": n.cfg.Attached, "links": n.linkCount(), "nat_dropped": n.natDropped.Load(), "hidden": n.cfg.Hidden, "sid": n.hexSid(), "onion": n.cfg.Onion, "onion_relayed": n.relayed.Load(), "onion_delivered": n.delivered.Load(), "onion_dropped": n.dropped.Load(), "get_direct": n.getDirect.Load(), "get_onion": n.getOnion.Load(), "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
 }
 
 func (n *Node) serveHTTP() error {
@@ -103,4 +103,10 @@ func (n *Node) serveHTTP() error {
 		wj(w, 200, res)
 	})
 	return (&http.Server{Addr: n.cfg.HTTP, Handler: mux, ReadHeaderTimeout: 5 * time.Second}).ListenAndServe()
+}
+
+func (n *Node) linkCount() int {
+	n.linkMu.Lock()
+	defer n.linkMu.Unlock()
+	return len(n.links)
 }
