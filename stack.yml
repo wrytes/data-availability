@@ -1,0 +1,42 @@
+# Two isolated "regions" (separate overlay subnets) joined only by bridge nodes.
+#   node-a  ->  region-a
+#   node-b  ->  region-b
+#   bridge  ->  region-a + region-b   (sees everything; use these as clients)
+# Scale any of them:  docker service scale da_node-a=20
+x-node: &node
+  image: da:dev
+  environment: &env
+    REPLICATION: "2"
+    LOSS: "0"          # simulated inbound UDP loss, e.g. "0.2"
+    MAX_BYTES: "268435456"
+
+services:
+  node-a:
+    <<: *node
+    environment:
+      <<: *env
+      DISCOVER: tasks.node-a,tasks.bridge
+    networks: [region-a]
+    deploy: { replicas: 4 }
+  node-b:
+    <<: *node
+    environment:
+      <<: *env
+      DISCOVER: tasks.node-b,tasks.bridge
+    networks: [region-b]
+    deploy: { replicas: 4 }
+  bridge:
+    <<: *node
+    environment:
+      <<: *env
+      DISCOVER: tasks.node-a,tasks.node-b,tasks.bridge
+    networks: [region-a, region-b]
+    deploy: { replicas: 2 }
+
+networks:
+  region-a:
+    driver: overlay
+    ipam: { config: [{ subnet: 10.77.1.0/24 }] }
+  region-b:
+    driver: overlay
+    ipam: { config: [{ subnet: 10.77.2.0/24 }] }
