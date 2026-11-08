@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>How Shards Survive</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+/* Layout: step rail on top, one SVG stage that morphs per step, text + controls below, live meter at the bottom. */
+:root{
+  --bg:#eef2f5; --panel:#ffffff; --ink:#101c26; --mute:#556573; --line:#c9d4dc; --soft:#e3eaef;
+  --data:#0b7a73; --on-data:#ffffff; --parity:#b8700d; --on-parity:#ffffff;
+  --cipher:#1c2c3c; --on-cipher:#cfe0ee;
+  --l1:#86a0cc; --l2:#4f71ab; --l3:#243f6e;
+  --ok:#1b8f55; --bad:#c9453a; --bad-soft:#f6dcd8; --accent:#0b7a73;
+  --display:'Bricolage Grotesque',system-ui,sans-serif; --body:'IBM Plex Sans',system-ui,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0d151c; --panel:#141f28; --ink:#e6eef4; --mute:#93a6b5; --line:#27394a; --soft:#1c2b37;
+  --data:#34c3b8; --on-data:#05201e; --parity:#e8a33d; --on-parity:#2a1a02;
+  --cipher:#2b4258; --on-cipher:#cfe0ee;
+  --l1:#5f7fb3; --l2:#86a6d8; --l3:#b5ccf0;
+  --ok:#42c880; --bad:#ef6b5c; --bad-soft:#40201d; --accent:#34c3b8; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0d151c; --panel:#141f28; --ink:#e6eef4; --mute:#93a6b5; --line:#27394a; --soft:#1c2b37;
+  --data:#34c3b8; --on-data:#05201e; --parity:#e8a33d; --on-parity:#2a1a02;
+  --cipher:#2b4258; --on-cipher:#cfe0ee;
+  --l1:#5f7fb3; --l2:#86a6d8; --l3:#b5ccf0;
+  --ok:#42c880; --bad:#ef6b5c; --bad-soft:#40201d; --accent:#34c3b8; color-scheme:dark}
+
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:16px/1.55 var(--body);margin:0;
+  padding-block:28px 48px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.wrap{max-width:980px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+header h1{font:700 clamp(28px,5vw,44px)/1.05 var(--display);letter-spacing:-.02em;margin:0 0 6px;text-wrap:balance}
+header p{margin:0;color:var(--mute);max-width:60ch}
+
+.rail{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+.rail button{all:unset;cursor:pointer;box-sizing:border-box;padding:8px 6px;border-radius:6px;border:1px solid var(--line);background:var(--panel);
+  font:500 12px/1.2 var(--mono);color:var(--mute);display:flex;flex-direction:column;gap:3px;min-width:0}
+.rail button b{font:700 15px var(--display);color:var(--ink)}
+.rail button[aria-current="step"]{border-color:var(--accent);box-shadow:inset 0 -3px 0 var(--accent);color:var(--ink)}
+.rail button:focus-visible,.btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.rail i{display:block;height:3px;background:var(--line);border-radius:2px;overflow:hidden}
+.rail i s{display:block;height:100%;width:0;background:var(--accent)}
+.rail button.run i s{width:100%;transition:width var(--dwell,8s) linear}
+
+.stagebox{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow-x:auto}
+svg#stage{display:block;width:100%;min-width:640px;height:auto}
+svg text{font-family:var(--mono);fill:var(--ink)}
+.mute{fill:var(--mute)!important}
+
+/* generic show/hide by step */
+.sh{opacity:0;transition:opacity .45s;pointer-events:none}
+.sh.on{opacity:1;transition-delay:var(--d,0s)}
+
+/* tiles */
+.tile,.copy{transition:transform .9s cubic-bezier(.55,0,.2,1),opacity .4s;transition-delay:var(--d,0s)}
+.tile .body{fill:var(--soft);stroke:var(--line);stroke-width:1.5;transition:fill .5s}
+.tile .ti{font-size:12px;font-weight:500;text-anchor:middle}
+.eq1 .tile .body{fill:var(--cipher)} .eq1 .tile .ti{fill:var(--on-cipher)}
+.ge2 .tile.d .body{fill:var(--data)} .ge2 .tile.p .body{fill:var(--parity)}
+.ge2 .tile.d .ti{fill:var(--on-data)} .ge2 .tile.p .ti{fill:var(--on-parity)}
+.ring{fill:none;stroke-width:2.2;opacity:0;transform:scale(.7);transform-box:fill-box;transform-origin:center;transition:opacity .5s,transform .5s}
+.r1{stroke:var(--l1)} .r2{stroke:var(--l2)} .r3{stroke:var(--l3)}
+.eq1 .ring{opacity:1;transform:none;transition-delay:calc(var(--k)*.7s + .3s)}
+
+/* tree */
+.edge{fill:none;stroke:var(--line);stroke-width:1.6;stroke-dasharray:1;stroke-dashoffset:1;transition:stroke-dashoffset .6s,stroke .3s,stroke-width .3s}
+.eq3 .edge{stroke-dashoffset:0;transition-delay:calc(var(--lv)*.3s)}
+.edge.hl{stroke:var(--accent);stroke-width:3.2}
+.hn{fill:var(--panel);stroke:var(--mute);stroke-width:1.6;transition:fill .3s}
+.hn.hl{fill:var(--parity);stroke:var(--parity)}
+.rootchip rect{fill:var(--ink)} .rootchip text{fill:var(--bg);font-size:14px;font-weight:500;text-anchor:middle}
+
+/* network */
+.region{fill:var(--soft);stroke:var(--line);stroke-width:1.5;stroke-dasharray:6 5;opacity:.7}
+.ncirc{fill:var(--panel);stroke:var(--ok);stroke-width:2.5;transition:fill .3s,stroke .3s;cursor:pointer}
+.node text{font-size:11px;text-anchor:middle;pointer-events:none;font-weight:500}
+.node.dead .ncirc{fill:var(--bad-soft);stroke:var(--bad)}
+.node.ping .ncirc{animation:ping .55s ease-out}
+@keyframes ping{0%{stroke-width:2.5}40%{stroke-width:10}100%{stroke-width:2.5}}
+.node:hover .ncirc{stroke-width:4}
+.copy circle{fill:var(--data);stroke:var(--panel);stroke-width:1.5;transition:fill .3s}
+.copy.p circle{fill:var(--parity)}
+.copy.dead circle{fill:var(--line)}
+.copy.used circle{stroke:var(--ink);stroke-width:2.5}
+.copy.lost{opacity:0!important}
+.probe{stroke:var(--accent);stroke-width:2.5;stroke-dasharray:6 6;animation:dash .5s linear infinite;opacity:0;transition:opacity .2s}
+.probe.on{opacity:1}
+@keyframes dash{to{stroke-dashoffset:-12}}
+.vf circle{fill:var(--ink)} .vf text{font-size:13px}
+
+.panel{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:20px;align-items:start}
+.panel h2{font:700 24px/1.15 var(--display);margin:0 0 6px;letter-spacing:-.01em}
+.panel p{margin:0 0 8px;max-width:62ch}
+.ref{font:400 12px var(--mono);color:var(--mute)}
+.ctl{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.btn{all:unset;cursor:pointer;box-sizing:border-box;padding:9px 14px;border-radius:6px;border:1px solid var(--line);background:var(--panel);font:500 13px var(--mono);color:var(--ink)}
+.btn:hover{border-color:var(--accent)}
+.btn.main{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.btn[disabled]{opacity:.4;cursor:default}
+
+.meter{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:10px}
+.mhead{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+.mhead b{font:700 28px var(--display)} 
+.pill{font:500 12px var(--mono);padding:3px 10px;border-radius:99px;background:var(--ok);color:#fff}
+.pill.bad{background:var(--bad)}
+.bar{position:relative;height:14px;background:var(--soft);border-radius:7px;overflow:visible}
+.bar i{display:block;height:100%;border-radius:7px;background:var(--data);transition:width .5s,background .3s}
+.bar.bad i{background:var(--bad)}
+.bar u{position:absolute;left:50%;top:-5px;bottom:-5px;width:2px;background:var(--ink)}
+.bar span{position:absolute;left:50%;top:20px;transform:translateX(-50%);font:400 11px var(--mono);color:var(--mute);white-space:nowrap}
+.mnote{margin:14px 0 0;color:var(--mute);font-size:14px;min-height:1.5em}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+[hidden]{display:none!important}
+@media (max-width:640px){.panel{grid-template-columns:1fr}.ctl{justify-content:flex-start}.rail button span{display:none}}
+@media (prefers-reduced-motion:reduce){*{transition-duration:.01ms!important;transition-delay:0s!important;animation-duration:.01ms!important}}
+</style>
+
+
+</head><body>
+<div class="wrap">
+<header>
+  <h1>How Shards Survive</h1>
+  <p>A file goes in, gets locked, split, fingerprinted and scattered across strangers' machines. Half of the pieces can vanish and it still comes back. Seven steps, click through or press play.</p>
+</header>
+
+<nav class="rail" id="rail" aria-label="Steps"></nav>
+
+<div class="stagebox">
+<svg id="stage" viewBox="0 0 800 500" role="img" aria-label="Animated diagram of the pipeline">
+  <!-- network backdrop -->
+  <g class="sh" data-steps="4 5 6">
+    <ellipse class="region" cx="270" cy="220" rx="215" ry="172"/>
+    <ellipse class="region" cx="530" cy="220" rx="215" ry="172"/>
+    <text class="mute" x="150" y="412" text-anchor="middle" font-size="13">region A · subnet 10.77.1.0/24</text>
+    <text class="mute" x="650" y="412" text-anchor="middle" font-size="13">region B · subnet 10.77.2.0/24</text>
+    <text class="mute" x="400" y="214" text-anchor="middle" font-size="12">bridges</text>
+    <text class="mute" x="400" y="230" text-anchor="middle" font-size="12">(see both)</text>
+  </g>
+
+  <!-- step labels -->
+  <text class="sh" data-steps="0" x="400" y="188" text-anchor="middle" font-size="15">your file, cut into 10 chunks of 640 bytes</text>
+  <g id="legend"></g>
+  <text class="sh mute" data-steps="1" x="400" y="320" text-anchor="middle" font-size="14" style="--d:2.4s">three independent keys, derived from one secret that never leaves your manifest</text>
+
+  <text class="sh" data-steps="2" x="50" y="124" font-size="14" fill="var(--data)" style="fill:var(--data)">10 data shards</text>
+  <text class="sh" data-steps="2" x="50" y="346" font-size="14" style="fill:var(--parity)">10 parity shards, computed from the data</text>
+  <text class="sh" data-steps="2" x="400" y="410" text-anchor="middle" font-size="17" font-weight="500" style="--d:1s">any 10 of these 20 rebuild the file</text>
+
+  <text class="sh mute" data-steps="3" x="400" y="40" text-anchor="middle" font-size="14">hash every shard, hash the hashes, repeat until one remains</text>
+  <g id="tree" class="sh" data-steps="3"></g>
+  <text class="sh" id="proofnote" x="400" y="472" text-anchor="middle" font-size="14">shard d6 plus its 5 highlighted hashes proves it belongs to the root</text>
+
+  <!-- moving things -->
+  <g id="tiles"></g>
+  <g id="copies"></g>
+
+  <!-- nodes -->
+  <g id="nodes" class="sh" data-steps="4 5 6"></g>
+
+  <text class="sh" data-steps="4" x="400" y="478" text-anchor="middle" font-size="14">UDP datagrams, no handshake. Each shard goes to the 2 nodes closest to its hash.</text>
+  <text class="sh" id="lostnote" x="400" y="496" text-anchor="middle" font-size="13" style="fill:var(--bad)">5 packets lost on the way, sender retries them</text>
+
+  <!-- light client -->
+  <g class="sh vf" data-steps="5">
+    <line id="probe" class="probe" x1="400" y1="446" x2="400" y2="446"/>
+    <circle cx="400" cy="458" r="14"/>
+    <text x="400" y="463" text-anchor="middle" style="fill:var(--bg)" font-size="14">?</text>
+    <text x="424" y="456" font-size="13">light client</text>
+    <text x="424" y="474" font-size="12" class="mute" id="sres">keeps only the root</text>
+  </g>
+</svg>
+</div>
+
+<section class="panel">
+  <div>
+    <h2 id="ptitle"></h2>
+    <p id="pbody"></p>
+    <div class="ref" id="pref"></div>
+  </div>
+  <div class="ctl">
+    <button class="btn" id="back">Back</button>
+    <button class="btn main" id="play">Play</button>
+    <button class="btn" id="next">Next</button>
+  </div>
+</section>
+
+<section class="meter" id="meter" hidden>
+  <div class="mhead"><b id="mcount">20 / 20</b><span>distinct shards reachable, 10 needed</span><span class="pill" id="mpill">recoverable</span></div>
+  <div class="bar" id="mbar"><i id="mfill" style="width:100%"></i><u></u><span>50%</span></div>
+  <p class="mnote" id="mnote"></p>
+  <div class="acts">
+    <button class="btn" id="kill1">Kill a random node</button>
+    <button class="btn" id="killB">Kill region B</button>
+    <button class="btn" id="revive">Revive all</button>
+  </div>
+  <div class="ref">Click any node in the diagram to toggle it. This demo uses 20 shards; the real code makes one per 640 bytes of file.</div>
+</section>
+</div>
+
+<script>
+(function(){
+const NS='http://www.w3.org/2000/svg';
+const $=s=>document.querySelector(s);
+const el=(t,a,p)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);if(p)p.appendChild(e);return e};
+const mv=(e,x,y)=>{e.style.transform='translate('+x+'px,'+y+'px)'};
+const stage=$('#stage');
+const STEPS=[
+ {n:'File',t:'Start with a file',b:'The file is cut into 640-byte chunks. Every chunk will become one shard. Nothing has left your machine yet.',r:'codec.go · Put'},
+ {n:'Encrypt',t:'Wrap it in three locks',b:'Three different ciphers are applied one after another, each with its own key from a different hash function. If one cipher ever breaks, the other two still hold. Storage nodes only ever see noise.',r:'crypt.go · AES-GCM → XChaCha20 → ChaCha20'},
+ {n:'Encode',t:'Add ten extra shards',b:'Reed-Solomon coding turns 10 data shards into 20. Any 10 of the 20, whichever ones, are enough to rebuild the file. Half the network can disappear.',r:'codec.go · reedsolomon, K data + K parity'},
+ {n:'Commit',t:'Fingerprint everything',b:'Every shard is hashed, pairs of hashes are hashed together, up to a single root. The root is a short commitment. Any shard plus a few sibling hashes proves it belongs to it, so nobody can hand you fake data.',r:'merkle.go · verifyShard'},
+ {n:'Scatter',t:'Send shards to strangers',b:'Each shard goes to the 2 nodes whose ID is closest to the shard\'s hash, so nobody picks who stores what. Packets get lost on UDP; the sender simply retries.',r:'node.go · holders, STORE over UDP'},
+ {n:'Sample',t:'Check without downloading',b:'A light client asks for a few random shards and checks each against the root. If more than half were being withheld, every check would fail about half the time. After n clean checks the chance of trouble is below 1 in 2ⁿ.',r:'codec.go · Audit (data availability sampling)'},
+ {n:'Survive',t:'Break things',b:'Kill nodes or a whole region. The file is lost only when fewer than 10 distinct shards remain anywhere. The ten shards used for the rebuild get a dark outline.',r:'codec.go · Get'}
+];
+const NODES=[[100,190,'a1'],[160,310,'a2'],[230,100,'a3'],[250,300,'a4'],[215,200,'a5'],
+ [700,190,'b1'],[640,310,'b2'],[570,100,'b3'],[550,300,'b4'],[585,200,'b5'],[400,130,'br1'],[400,290,'br2']];
+const REGION_B=[5,6,7,8,9];
+const prim=i=>(i*7+2)%12, repl=i=>(prim(i)+3+(i%4)*2)%12;
+const alive=NODES.map(()=>true);
+const order=[...Array(20).keys()].sort(()=>Math.random()-.5);
+let step=0,playing=false,timers=[],tok=0,ok=0,tot=0;
+const DWELL=8000;
+
+/* rail */
+const rail=$('#rail');
+STEPS.forEach((s,i)=>{const b=document.createElement('button');b.innerHTML='<b>'+(i+1)+'</b><span>'+s.n+'</span><i><s></s></i>';b.onclick=()=>{playing=false;go(i)};rail.appendChild(b)});
+
+/* legend */
+const lg=$('#legend');
+[['AES-256-GCM','key from SHA-256','r1'],['XChaCha20-Poly1305','key from SHA3-256','r2'],['ChaCha20-Poly1305','key from BLAKE2b','r3']].forEach((l,k)=>{
+  const g=el('g',{class:'sh','data-steps':'1',style:'--d:'+(.4+k*.7)+'s'},lg);
+  el('rect',{x:60,y:60+k*28,width:18,height:18,rx:4,class:'ring '+l[2],style:'opacity:1;transform:none;fill:none;stroke-width:3'},g);
+  const t=el('text',{x:90,y:74+k*28,'font-size':14},g);t.textContent='layer '+(k+1)+'  '+l[0];
+  const u=el('text',{x:330,y:74+k*28,'font-size':13,class:'mute'},g);u.textContent=l[1];
+});
+
+/* tiles */
+const tiles=[],copies=[];
+for(let i=0;i<20;i++){
+  const g=el('g',{class:'tile '+(i<10?'d':'p')},$('#tiles'));
+  for(let k=3;k>=1;k--)el('rect',{class:'ring r'+k,x:-5*k,y:-5*k,width:32+10*k,height:32+10*k,rx:7,style:'--k:'+(k-1)},g);
+  el('rect',{class:'body',width:32,height:32,rx:5},g);
+  tiles.push({g,t:el('text',{class:'ti',x:16,y:21},g)});
+}
+for(let j=0;j<40;j++){
+  const g=el('g',{class:'copy '+((j>>1)<10?'d':'p')},$('#copies'));
+  el('circle',{r:6},g);g.style.opacity=0;copies.push(g);
+}
+const hex=()=>Math.floor(Math.random()*256).toString(16).padStart(2,'0');
+function layout(s,i){
+  if(s<=1)return [50+(i%10)*70,215];
+  if(s===2)return i<10?[50+i*70,140]:[50+(i-10)*70,290];
+  return [20+i*38,400];
+}
+function tileText(s,i){return s===0?'c'+(i%10):s===1?hex():(i<10?'d'+i:'p'+(i-10))}
+
+/* tree */
+const levels=[];
+(function(){
+  let lv=[...Array(20)].map((_,i)=>({x:20+i*38+16,y:400}));levels.push(lv);
+  while(lv.length>1){const nx=[];for(let i=0;i<lv.length;i+=2){const a=lv[i],b=lv[i+1]||a;nx.push({x:(a.x+b.x)/2})}levels.push(nx);lv=nx}
+  const g=$('#tree');
+  levels.forEach((lv,L)=>lv.forEach((n,idx)=>{
+    n.y=400-48*L;
+    if(L<levels.length-1){const p=levels[L+1][idx>>1];p.y=400-48*(L+1);
+      n.edge=el('path',{class:'edge',d:'M'+n.x+' '+n.y+'L'+p.x+' '+p.y,pathLength:1,style:'--lv:'+L},g)}
+  }));
+  levels.forEach((lv,L)=>{if(L>0&&L<levels.length-1)lv.forEach(n=>{n.c=el('circle',{class:'hn',cx:n.x,cy:n.y,r:5},g)})});
+  const r=levels[levels.length-1][0],rc=el('g',{class:'rootchip'},g);
+  el('rect',{x:r.x-70,y:r.y-34,width:140,height:28,rx:5},rc);
+  const t=el('text',{x:r.x,y:r.y-15},rc);t.textContent='root 9c41…e07';
+})();
+function hlPath(leaf){
+  let idx=leaf;
+  for(let L=0;L<levels.length-1;L++){
+    levels[L][idx].edge.classList.add('hl');
+    const sib=levels[L][idx^1]||levels[L][idx];
+    if(sib.edge)sib.edge.classList.add('hl');
+    if(sib.c)sib.c.classList.add('hl');
+    idx>>=1;
+  }
+}
+
+/* nodes */
+const nodeEls=[],slots=NODES.map(()=>[]);
+for(let j=0;j<40;j++){const i=j>>1;slots[(j&1)?repl(i):prim(i)].push(j)}
+NODES.forEach((n,k)=>{
+  const g=el('g',{class:'node'},$('#nodes'));
+  el('circle',{class:'ncirc',cx:n[0],cy:n[1],r:18},g);
+  const t=el('text',{x:n[0],y:n[1]+4},g);t.textContent=n[2];
+  g.onclick=()=>{alive[k]=!alive[k];refresh()};
+  nodeEls.push({g,t});
+});
+function copyPos(j){
+  const k=(j&1)?repl(j>>1):prim(j>>1),s=slots[k].indexOf(j),c=Math.max(slots[k].length,3);
+  const a=-Math.PI/2+2*Math.PI*s/c+k*.4;
+  return [NODES[k][0]+34*Math.cos(a),NODES[k][1]+34*Math.sin(a)];
+}
+
+/* state -> visuals */
+const reach=i=>alive[prim(i)]||alive[repl(i)];
+function refresh(){
+  const r=[...Array(20).keys()].filter(reach),okk0=r.length>=10,used=new Set(order.filter(reach).slice(0,10));
+  nodeEls.forEach((n,k)=>{n.g.classList.toggle('dead',!alive[k]);n.t.textContent=alive[k]?NODES[k][2]:'✕'});
+  copies.forEach((c,j)=>{const i=j>>1,k=(j&1)?repl(i):prim(i);
+    c.classList.toggle('dead',!alive[k]);c.classList.toggle('used',step===6&&okk0&&used.has(i)&&alive[k]&&firstHolder(i)===k)});
+  const okk=r.length>=10;
+  $('#mcount').textContent=r.length+' / 20';
+  $('#mfill').style.width=(r.length*5)+'%';
+  $('#mbar').classList.toggle('bad',!okk);
+  const p=$('#mpill');p.textContent=okk?'recoverable':'lost';p.classList.toggle('bad',!okk);
+  if(step===6)$('#mnote').textContent=okk?'The file decrypts and matches byte for byte.':'Fewer than 10 distinct shards left. No node can restore the rest.';
+}
+const firstHolder=i=>alive[prim(i)]?prim(i):repl(i);
+
+/* layout per step */
+function clearTimers(){timers.forEach(clearTimeout);timers=[]}
+const later=(f,ms)=>timers.push(setTimeout(f,ms));
+function go(s){
+  clearTimers();tok++;
+  const prev=step;step=s;
+  stage.setAttribute('class','');
+  stage.classList.add('eq'+s);for(let n=1;n<=6;n++)if(s>=n)stage.classList.add('ge'+n);
+  document.querySelectorAll('#stage [data-steps]').forEach(e=>e.classList.toggle('on',e.dataset.steps.split(' ').includes(String(s))));
+  $('#proofnote').classList.remove('on');$('#lostnote').classList.remove('on');
+  document.querySelectorAll('.hl').forEach(e=>e.classList.remove('hl'));
+  tiles.forEach((t,i)=>{
+    const [x,y]=layout(s,i);mv(t.g,x,y);t.g.style.setProperty('--d',((i%10)*45)+'ms');
+    t.t.textContent=tileText(s,i);
+    t.g.style.opacity=(s>=4||(i>=10&&s<=1))?0:1;
+  });
+  copies.forEach((c,j)=>{
+    c.classList.remove('lost');c.style.setProperty('--d',(j*22)+'ms');
+    if(s<4){const [x,y]=layout(s,j>>1);mv(c,x+16,y+16);c.style.opacity=0;return}
+    c.style.opacity=1;const [px,py]=copyPos(j);
+    if(s===4&&prev===3&&j%8===3){ // a few packets get lost mid-flight, then retried
+      const [x,y]=layout(3,j>>1);mv(c,(x+16+px)/2,(y+16+py)/2);
+      later(()=>c.classList.add('lost'),900);
+      later(()=>{c.classList.remove('lost');mv(c,px,py)},2300);
+    } else mv(c,px,py);
+  });
+  if(s===4&&prev===3){later(()=>$('#lostnote').classList.add('on'),1000)}
+  if(s===3)later(()=>{hlPath(6);$('#proofnote').classList.add('on')},2600);
+  /* panel */
+  $('#ptitle').textContent=STEPS[s].t;$('#pbody').textContent=STEPS[s].b;$('#pref').textContent=STEPS[s].r;
+  rail.querySelectorAll('button').forEach((b,i)=>{if(i===s)b.setAttribute('aria-current','step');else b.removeAttribute('aria-current');b.classList.remove('run')});
+  $('#back').disabled=s===0;$('#next').disabled=s===STEPS.length-1;
+  $('#meter').hidden=s<4;
+  $('#mnote').textContent=s===4?'Shards are in flight. Once they land, every shard lives on 2 different nodes.':s===5?'Click nodes to kill them and watch the checks start to fail.':'';
+  $('#sres').textContent='keeps only the root';
+  if(s===5){ok=0;tot=0;sampling(tok)}
+  if(s===6&&playing)chaos();
+  refresh();
+  if(playing){
+    const b=rail.children[s];b.style.setProperty('--dwell',DWELL+'ms');requestAnimationFrame(()=>requestAnimationFrame(()=>b.classList.add('run')));
+    if(s<STEPS.length-1)later(()=>go(s+1),DWELL);else later(()=>{playing=false;$('#play').textContent='Replay'},DWELL);
+  }
+  $('#play').textContent=playing?'Pause':(s===STEPS.length-1&&prev===s?'Replay':'Play');
+}
+
+/* sampling */
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+async function sampling(t){
+  await wait(2200);
+  while(t===tok){
+    const i=Math.floor(Math.random()*20),hs=[prim(i),repl(i)],probe=$('#probe');let good=false;
+    const lab=i<10?'d'+i:'p'+(i-10);
+    for(const h of hs){
+      if(t!==tok)return;
+      probe.setAttribute('x2',NODES[h][0]);probe.setAttribute('y2',NODES[h][1]);probe.classList.add('on');
+      $('#sres').textContent='asking '+NODES[h][2]+' for shard '+lab+'…';
+      await wait(650);if(t!==tok)return;
+      if(alive[h]){good=true;const n=nodeEls[h].g;n.classList.add('ping');setTimeout(()=>n.classList.remove('ping'),600);
+        $('#sres').textContent='shard '+lab+' + proof matches the root ✓';break}
+      $('#sres').textContent=NODES[h][2]+' did not answer';await wait(450);
+    }
+    probe.classList.remove('on');tot++;if(good)ok++;
+    if(!good)$('#sres').textContent='shard '+lab+' not found anywhere ✕';
+    $('#mnote').textContent=ok===tot
+      ?ok+' of '+tot+' checks passed. Chance that the file is already unrecoverable: below '+(100/Math.pow(2,ok)<0.01?'0.01':(100/Math.pow(2,ok)).toFixed(ok<4?0:ok<8?1:2))+'%.'
+      :ok+' of '+tot+' checks passed. Availability is not proven.';
+    await wait(900);
+  }
+}
+
+/* chaos script for autoplay on the last step */
+function chaos(){
+  later(()=>{REGION_B.forEach(k=>alive[k]=false);refresh()},1500);
+  later(()=>{alive[2]=false;alive[10]=false;refresh()},3500);
+  later(()=>{alive[1]=false;alive[3]=false;refresh()},5500);
+}
+function killRandom(){const a=alive.map((v,k)=>v?k:-1).filter(k=>k>=0);if(a.length){alive[a[Math.floor(Math.random()*a.length)]]=false;refresh()}}
+
+$('#back').onclick=()=>{playing=false;go(Math.max(0,step-1))};
+$('#next').onclick=()=>{playing=false;go(Math.min(STEPS.length-1,step+1))};
+$('#play').onclick=()=>{
+  if(playing){playing=false;go(step);return}
+  playing=true;go(step===STEPS.length-1?0:step);
+};
+$('#kill1').onclick=killRandom;
+$('#killB').onclick=()=>{REGION_B.forEach(k=>alive[k]=false);refresh()};
+$('#revive').onclick=()=>{alive.fill(true);refresh()};
+document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')$('#next').click();if(e.key==='ArrowLeft')$('#back').click()});
+
+go(0);
+if(!matchMedia('(prefers-reduced-motion: reduce)').matches){playing=true;go(0)}
+})();
+</script>
+
+</body></html>
