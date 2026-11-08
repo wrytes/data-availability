@@ -6,6 +6,7 @@
     scripts/demo.sh repair   # kill region B, watch copies get rebuilt, then drop more nodes
     scripts/demo.sh persist  # restart every node, data comes back from disk
     scripts/demo.sh onion    # same traffic over onion routes: holders never see the requester
+    scripts/demo.sh hidden   # store on, and read back from, a holder nobody can see
     docker service scale da_node-a=20
     scripts/demo.sh down
 
@@ -48,6 +49,22 @@ Client requests (`STORE` and `GET` for put/get/audit/rebuild) can travel over a 
 - **Shard size is 256 B** because a STORE (shard + a depth-16 Merkle proof) and a reply block must fit in one packet.
 - Not hidden: the requester from its *first* relay, and traffic volume from an observer of the whole network (needs real mixing and a lot of cover traffic). No forward secrecy:
   relay keys are long-lived. Repair traffic between nodes stays direct.
+
+## Hidden holders (`HIDDEN=1`)
+A hidden node stores shards that only people holding its service id can reach. It is built from the same onion packets, in the style of Tor hidden services:
+
+1. The node has a service identity (Ed25519 + an X25519 key, unrelated to its relay key) and talks only to its guards (`DISCOVER`). It pings them with a *private* flag, so they answer
+   but never list or gossip it. It ignores direct requests and pings.
+2. It picks 3 **introduction points** among its guards and keeps a stock of single-use reply blocks (leading back to it) at each. It publishes a signed **descriptor**
+   {keys, introduction points} to the directory nodes closest to its service id, over onion routes.
+3. A client fetches the descriptor, gives a **rendezvous point** one of its own reply blocks under a random cookie, and sends an end-to-end encrypted `INTRODUCE`
+   {rendezvous point, cookie, request} to an introduction point, which pushes it into one of the node's reply blocks.
+4. The node decrypts, serves the request, and sends the encrypted answer to the rendezvous point, which pushes it into the client's reply block.
+
+The introduction point knows neither side's address; the rendezvous point knows neither side and cannot read the answer; directories only hold a signed blob.
+`da put <service id>` stores every shard there too (listed in the manifest), `da get - hidden < manifest.json` reads from hidden holders only.
+Limits: hidden replicas are not repaired, a client can only use introduction points it has as direct peers, directories are found by "closest in my view" (clients also try other peers),
+and one request costs about three onion round trips, so this suits modest data volumes.
 
 ## Findings / insights
 - **Layers**: stacking ciphers is cheap here (AEAD, ~40 B overhead per layer) and protects against a break of one primitive,

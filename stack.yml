@@ -39,6 +39,18 @@ services:
       DISCOVER: tasks.node-a,tasks.node-b,tasks.bridge
     networks: [region-a, region-b]
     deploy: { replicas: 2 }
+  # A hidden holder: its only contacts are the nodes in DISCOVER (its guards). Nobody lists
+  # or gossips it, it ignores direct requests, and clients reach it through rendezvous points.
+  hidden:
+    <<: *node
+    environment:
+      <<: *env
+      HIDDEN: "1"
+      ONION: "0"
+      COVER_RATE: "0"
+      DISCOVER: tasks.bridge,tasks.node-b
+    networks: [region-b]
+    deploy: { replicas: 1 }
 
 volumes:
   da-data: {}
