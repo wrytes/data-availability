@@ -53,7 +53,11 @@ func layerAEAD(master []byte, l layer) (cipher.AEAD, error) {
 }
 
 // seal wraps plaintext innermost->outermost: layer 0 first.
-func seal(master, pt []byte) ([]byte, error) {
+func aad(layer int, seg uint32) []byte {
+	return []byte{byte(layer), byte(seg >> 24), byte(seg >> 16), byte(seg >> 8), byte(seg)}
+}
+
+func seal(master, pt []byte, seg uint32) ([]byte, error) {
 	data := pt
 	for i, l := range layers {
 		a, err := layerAEAD(master, l)
@@ -64,12 +68,12 @@ func seal(master, pt []byte) ([]byte, error) {
 		if _, err := rand.Read(nonce); err != nil {
 			return nil, err
 		}
-		data = a.Seal(nonce, nonce, data, []byte{byte(i)})
+		data = a.Seal(nonce, nonce, data, aad(i, seg))
 	}
 	return data, nil
 }
 
-func open(master, ct []byte) ([]byte, error) {
+func open(master, ct []byte, seg uint32) ([]byte, error) {
 	data := ct
 	for i := len(layers) - 1; i >= 0; i-- {
 		a, err := layerAEAD(master, layers[i])
@@ -80,7 +84,7 @@ func open(master, ct []byte) ([]byte, error) {
 		if len(data) < ns+a.Overhead() {
 			return nil, errors.New("ciphertext too short")
 		}
-		data, err = a.Open(nil, data[:ns], data[ns:], []byte{byte(i)})
+		data, err = a.Open(nil, data[:ns], data[ns:], aad(i, seg))
 		if err != nil {
 			return nil, errors.New("decrypt failed at layer " + layers[i].name)
 		}

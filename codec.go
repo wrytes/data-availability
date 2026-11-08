@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	mrand "math/rand"
 	"sync"
@@ -20,25 +22,37 @@ const (
 	maxLeaves = 65536
 )
 
-// Manifest is the retrieval capability: it names the commitment and holds the
+// segSize is the plaintext size of one segment. Each segment is its own
+// Reed-Solomon codeword with its own Merkle root, which lifts the 65 536-shard
+// limit of a single codeword: files of any size are streamed segment by segment.
+// 16 MiB (+96 B of cipher overhead) is ~52 430 shards, safely under the limit.
+var segSize = 16 << 20
+
+// Seg is one independently coded and committed piece of the file.
+type Seg struct {
+	Root  string `json:"root"`
+	K     int    `json:"k"` // data shards; K parity shards follow (any K of 2K recover)
+	CtLen int    `json:"ctlen"`
+}
+
+// Manifest is the retrieval capability: it names the commitments and holds the
 // secret. Whoever holds it can fetch and decrypt; nodes never see the key.
 type Manifest struct {
-	V      int      `json:"v"`
-	Root   string   `json:"root"`
-	K      int      `json:"k"` // data shards
-	M      int      `json:"m"` // parity shards (any K of K+M recover)
-	Shard  int      `json:"shard"`
-	CtLen  int      `json:"ctlen"`
-	Key    string   `json:"key"`
-	Layers []string `json:"layers"`
+	V        int      `json:"v"`
+	Key      string   `json:"key"`
+	Layers   []string `json:"layers"`
+	Shard    int      `json:"shard"`
+	PlainLen int64    `json:"plainlen"`
+	Segs     []Seg    `json:"segs"`
 }
 
 type PutResult struct {
 	Manifest  Manifest `json:"manifest"`
+	Segments  int      `json:"segments"`
 	Shards    int      `json:"shards"`
 	Acked     int      `json:"shards_acked"`
 	Replicas  int      `json:"replica_acks"`
-	PlainSize int      `json:"plain_size"`
+	PlainSize int64    `json:"plain_size"`
 	Stored    int      `json:"stored_bytes_network"`
 }
 
@@ -67,18 +81,59 @@ loop:
 }
 
 func (n *Node) Put(ctx context.Context, pt []byte) (*PutResult, error) {
+	return n.PutReader(ctx, bytes.NewReader(pt))
+}
+
+// PutReader streams r in segSize pieces; memory use is bounded by one segment.
+func (n *Node) PutReader(ctx context.Context, r io.Reader) (*PutResult, error) {
 	master := make([]byte, 32)
 	rand.Read(master)
-	ct, err := seal(master, pt)
+	res := &PutResult{Manifest: Manifest{V: 2, Key: hex.EncodeToString(master), Layers: layerNames(), Shard: shardSize}}
+	buf := make([]byte, segSize)
+	for idx := uint32(0); ; idx++ {
+		l, err := io.ReadFull(r, buf)
+		last := err == io.EOF || err == io.ErrUnexpectedEOF
+		if err != nil && !last {
+			return res, err
+		}
+		if l == 0 && idx > 0 { // file size was an exact multiple of segSize
+			break
+		}
+		sctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		seg, st, perr := n.putSegment(sctx, master, idx, buf[:l])
+		cancel()
+		res.Shards += st.shards
+		res.Acked += st.acked
+		res.Replicas += st.replicas
+		res.Stored += st.replicas * shardSize
+		if perr != nil {
+			return res, fmt.Errorf("segment %d: %w", idx, perr)
+		}
+		res.Manifest.Segs = append(res.Manifest.Segs, seg)
+		res.PlainSize += int64(l)
+		if last {
+			break
+		}
+	}
+	res.Manifest.PlainLen = res.PlainSize
+	res.Segments = len(res.Manifest.Segs)
+	return res, nil
+}
+
+type putStats struct{ shards, acked, replicas int }
+
+func (n *Node) putSegment(ctx context.Context, master []byte, idx uint32, pt []byte) (Seg, putStats, error) {
+	var st putStats
+	ct, err := seal(master, pt, idx)
 	if err != nil {
-		return nil, err
+		return Seg{}, st, err
 	}
 	k := (len(ct) + shardSize - 1) / shardSize
 	if k < 2 {
 		k = 2
 	}
 	if 2*k > maxLeaves {
-		return nil, fmt.Errorf("too large: max ~%d bytes", (maxLeaves/2)*shardSize)
+		return Seg{}, st, errors.New("segment too large")
 	}
 	total := 2 * k
 	shards := make([][]byte, total)
@@ -92,10 +147,10 @@ func (n *Node) Put(ctx context.Context, pt []byte) (*PutResult, error) {
 	}
 	enc, err := reedsolomon.New(k, k)
 	if err != nil {
-		return nil, err
+		return Seg{}, st, err
 	}
 	if err := enc.Encode(shards); err != nil {
-		return nil, err
+		return Seg{}, st, err
 	}
 	leaves := make([]Hash, total)
 	for i, s := range shards {
@@ -105,9 +160,9 @@ func (n *Node) Put(ctx context.Context, pt []byte) (*PutResult, error) {
 	root := levels[len(levels)-1][0]
 
 	var acked, replicas int64
-	acks := make([]int32, total)
 	parallel(ctx, total, 64, func(i int) {
 		proof := proofFor(levels, i)
+		got := false
 		for _, h := range n.holders(shardKey(root, uint32(i)), n.cfg.Replication) {
 			ok := false
 			if h.self {
@@ -116,23 +171,20 @@ func (n *Node) Put(ctx context.Context, pt []byte) (*PutResult, error) {
 				ok = len(m.body) > 0 && m.body[0] == 0
 			}
 			if ok {
-				atomic.AddInt32(&acks[i], 1)
+				got = true
 				atomic.AddInt64(&replicas, 1)
 			}
 		}
-		if acks[i] > 0 {
+		if got {
 			atomic.AddInt64(&acked, 1)
 		}
 	})
-	res := &PutResult{
-		Manifest: Manifest{V: 1, Root: hex.EncodeToString(root[:]), K: k, M: k, Shard: shardSize, CtLen: len(ct),
-			Key: hex.EncodeToString(master), Layers: layerNames()},
-		Shards: total, Acked: int(acked), Replicas: int(replicas), PlainSize: len(pt), Stored: int(replicas) * shardSize,
+	st = putStats{total, int(acked), int(replicas)}
+	seg := Seg{Root: hex.EncodeToString(root[:]), K: k, CtLen: len(ct)}
+	if need := k + (total-k)/2; int(acked) < need { // not enough margin to be useful
+		return seg, st, fmt.Errorf("only %d/%d shards acknowledged (need >= %d)", acked, total, need)
 	}
-	if int(acked) < k+(total-k)/2 { // not enough margin to be useful
-		return res, fmt.Errorf("only %d/%d shards acknowledged (need >= %d)", acked, total, k+(total-k)/2)
-	}
-	return res, nil
+	return seg, st, nil
 }
 
 // fetchShard asks the closest holders (replication + spares) until one returns
@@ -144,10 +196,7 @@ func (n *Node) fetchShard(ctx context.Context, root Hash, total, i int) ([]byte,
 			return nil, false
 		}
 		if h.self {
-			n.smu.RLock()
-			s, ok := n.store[key]
-			n.smu.RUnlock()
-			if ok {
+			if s, ok := n.store.get(root, uint32(i)); ok {
 				return s.data, true
 			}
 			continue
@@ -167,26 +216,9 @@ func (n *Node) fetchShard(ctx context.Context, root Hash, total, i int) ([]byte,
 	return nil, false
 }
 
-func parseRoot(mf Manifest) (Hash, error) {
-	var root Hash
-	b, err := hex.DecodeString(mf.Root)
-	if err != nil || len(b) != 32 || mf.K < 2 || mf.M != mf.K || mf.Shard != shardSize {
-		return root, errors.New("bad manifest")
-	}
-	copy(root[:], b)
-	return root, nil
-}
-
-func (n *Node) Get(ctx context.Context, mf Manifest) ([]byte, error) {
-	root, err := parseRoot(mf)
-	if err != nil {
-		return nil, err
-	}
-	master, err := hex.DecodeString(mf.Key)
-	if err != nil {
-		return nil, err
-	}
-	total := mf.K + mf.M
+// gather fetches random shards until k verified ones are in hand (any K of 2K
+// is enough, which is what makes loss on the way harmless).
+func (n *Node) gather(ctx context.Context, root Hash, total, k int) ([][]byte, error) {
 	got := make([][]byte, total)
 	var have int32
 	cctx, cancel := context.WithCancel(ctx)
@@ -199,67 +231,144 @@ func (n *Node) Get(ctx context.Context, mf Manifest) ([]byte, error) {
 		i := order[j]
 		if d, ok := n.fetchShard(cctx, root, total, i); ok {
 			got[i] = d
-			if int(atomic.AddInt32(&have, 1)) >= mf.K {
-				cancel() // probabilistic: any K of 2K is enough
+			if int(atomic.AddInt32(&have, 1)) >= k {
+				cancel()
 			}
 		}
 	})
-	if int(have) < mf.K {
-		return nil, fmt.Errorf("unavailable: only %d/%d shards retrievable (need %d)", have, total, mf.K)
+	if int(have) < k {
+		return nil, fmt.Errorf("unavailable: only %d/%d shards retrievable (need %d)", have, total, k)
 	}
-	enc, err := reedsolomon.New(mf.K, mf.M)
+	return got, nil
+}
+
+func (mf Manifest) check() ([]Hash, error) {
+	if mf.V != 2 || mf.Shard != shardSize || len(mf.Segs) == 0 {
+		return nil, errors.New("bad manifest")
+	}
+	roots := make([]Hash, len(mf.Segs))
+	for i, s := range mf.Segs {
+		b, err := hex.DecodeString(s.Root)
+		if err != nil || len(b) != 32 || s.K < 2 || 2*s.K > maxLeaves || s.CtLen < 0 || s.CtLen > s.K*shardSize {
+			return nil, fmt.Errorf("bad manifest: segment %d", i)
+		}
+		copy(roots[i][:], b)
+	}
+	return roots, nil
+}
+
+// GetTo streams the file to w one segment at a time.
+func (n *Node) GetTo(ctx context.Context, mf Manifest, w io.Writer) error {
+	roots, err := mf.check()
+	if err != nil {
+		return err
+	}
+	master, err := hex.DecodeString(mf.Key)
+	if err != nil {
+		return err
+	}
+	var written int64
+	for i, sg := range mf.Segs {
+		sctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		pt, err := n.getSegment(sctx, master, uint32(i), roots[i], sg)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("segment %d/%d: %w", i+1, len(mf.Segs), err)
+		}
+		if _, err := w.Write(pt); err != nil {
+			return err
+		}
+		written += int64(len(pt))
+	}
+	if written != mf.PlainLen {
+		return errors.New("length mismatch: manifest does not match data")
+	}
+	return nil
+}
+
+func (n *Node) getSegment(ctx context.Context, master []byte, idx uint32, root Hash, sg Seg) ([]byte, error) {
+	got, err := n.gather(ctx, root, 2*sg.K, sg.K)
+	if err != nil {
+		return nil, err
+	}
+	enc, err := reedsolomon.New(sg.K, sg.K)
 	if err != nil {
 		return nil, err
 	}
 	if err := enc.ReconstructData(got); err != nil {
 		return nil, err
 	}
-	ct := make([]byte, 0, mf.K*mf.Shard)
-	for i := 0; i < mf.K; i++ {
+	ct := make([]byte, 0, sg.K*shardSize)
+	for i := 0; i < sg.K; i++ {
 		ct = append(ct, got[i]...)
 	}
-	if mf.CtLen > len(ct) {
-		return nil, errors.New("bad manifest length")
+	return open(master, ct[:sg.CtLen], idx)
+}
+
+func (n *Node) Get(ctx context.Context, mf Manifest) ([]byte, error) {
+	var b bytes.Buffer
+	if err := n.GetTo(ctx, mf, &b); err != nil {
+		return nil, err
 	}
-	return open(master, ct[:mf.CtLen])
+	return b.Bytes(), nil
 }
 
 type AuditResult struct {
+	Segments    int     `json:"segments"`
 	Samples     int     `json:"samples"`
 	Available   int     `json:"available"`
-	Fraction    float64 `json:"fraction_available"`
+	Fraction    float64 `json:"fraction_available"` // worst segment
 	Recoverable bool    `json:"recoverable_by_sampling"`
 	FalseAccept float64 `json:"p_unrecoverable_given_all_samples_ok"`
 	Needed      int     `json:"shards_needed"`
 	TotalShards int     `json:"shards_total"`
 }
 
-// Audit is data-availability sampling: fetch s random shards and verify each
-// against the Merkle root. Data is unrecoverable only if >50% of shards are
-// withheld, so s clean samples bound that probability by 2^-s.
+// Audit is data availability sampling: per segment, fetch s random shards and
+// verify each against that segment's Merkle root. A segment is unrecoverable
+// only if >50% of its shards are withheld, so s clean samples bound that by
+// 2^-s; a union bound over all segments gives the figure for the whole file.
+// (Independent segments mean every segment must be sampled; coding across
+// segments, 2D, would let far fewer samples cover the whole file.)
 func (n *Node) Audit(ctx context.Context, mf Manifest, s int) (*AuditResult, error) {
-	root, err := parseRoot(mf)
+	roots, err := mf.check()
 	if err != nil {
 		return nil, err
 	}
-	total := mf.K + mf.M
-	if s > total {
-		s = total
-	}
-	idx := mrand.Perm(total)[:s]
-	var ok int32
-	parallel(ctx, s, 32, func(j int) {
-		if _, good := n.fetchShard(ctx, root, total, idx[j]); good {
-			atomic.AddInt32(&ok, 1)
+	r := &AuditResult{Segments: len(mf.Segs), Fraction: 1, Recoverable: true}
+	allClean := true
+	for si, sg := range mf.Segs {
+		total := 2 * sg.K
+		ss := s
+		if ss > total {
+			ss = total
 		}
-	})
-	frac := float64(ok) / float64(s)
-	r := &AuditResult{Samples: s, Available: int(ok), Fraction: frac, Needed: mf.K, TotalShards: total}
-	r.Recoverable = frac > 0.5
-	if int(ok) == s {
-		r.FalseAccept = math.Pow(0.5, float64(s))
-	} else {
-		r.FalseAccept = 1
+		sctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		idx := mrand.Perm(total)[:ss]
+		var ok int32
+		parallel(sctx, ss, 32, func(j int) {
+			if _, good := n.fetchShard(sctx, roots[si], total, idx[j]); good {
+				atomic.AddInt32(&ok, 1)
+			}
+		})
+		cancel()
+		frac := float64(ok) / float64(ss)
+		r.Samples += ss
+		r.Available += int(ok)
+		r.Needed += sg.K
+		r.TotalShards += total
+		r.Fraction = math.Min(r.Fraction, frac)
+		if frac <= 0.5 {
+			r.Recoverable = false
+		}
+		if int(ok) != ss {
+			allClean = false
+		}
+	}
+	r.FalseAccept = 1
+	if allClean {
+		per := s
+		r.FalseAccept = math.Min(1, float64(len(mf.Segs))*math.Pow(0.5, float64(per)))
 	}
 	return r, nil
 }
