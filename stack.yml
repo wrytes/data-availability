@@ -13,6 +13,9 @@ x-node: &node
     DATA_DIR: /data                                   # shards + node id survive restarts
     NODE_NAME: "{{.Service.Name}}-{{.Task.Slot}}"      # stable per-replica subdirectory
     REPAIR_INTERVAL: "10"                              # seconds between repair sweeps
+    ONION: "1"             # client requests travel over 3-hop onion routes (2 = never fall back to direct)
+    ONION_DELAY_MS: "20"   # max random delay each relay adds
+    COVER_RATE: "0.5"      # dummy onion packets per second per node
 
 services:
   node-a:

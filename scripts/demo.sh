@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: scripts/demo.sh up | demo | big | persist | repair | down
+# Usage: scripts/demo.sh up | demo | big | persist | repair | onion | down
 set -euo pipefail
 cd "$(dirname "$0")/.."
 STACK=da
@@ -25,6 +25,17 @@ json.dump(m,open("/tmp/da-m.json","w"))
 PY
 }
 check() { client get - < /tmp/da-m.json | cmp - "$1" && echo "  OK: byte-identical" || { echo "  FAILED"; return 1; }; }
+ostats() { # get_direct get_onion relayed dropped, summed over all nodes
+  for c in $(docker ps -qf name=${STACK}_); do docker exec "$c" da status; echo; done | python3 -c '
+import sys,json
+t=[0,0,0,0]
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    j=json.loads(l)
+    for i,k in enumerate(["get_direct","get_onion","onion_relayed","onion_dropped"]): t[i]+=j[k]
+print(*t)'
+}
 wait_peers() { sleep "${1:-20}"; }
 
 case "${1:-demo}" in
@@ -61,4 +72,12 @@ repair)
   echo "== now also drop two region-A nodes"; docker service scale --detach ${STACK}_node-a=2 >/dev/null; sleep 20; echo -n "  "; stats
   echo "== get"; check /tmp/da-in.bin
   docker service scale --detach ${STACK}_node-a=4 ${STACK}_node-b=4 >/dev/null ;;
+onion)
+  head -c 300000 /dev/urandom > /tmp/da-in.bin
+  read d0 o0 r0 x0 <<< "$(ostats)"
+  echo "== put + get (client requests go through 2 relays each)"; putfile /tmp/da-in.bin; check /tmp/da-in.bin
+  read d1 o1 r1 x1 <<< "$(ostats)"
+  echo "  GET requests served directly (holder saw the requester): $((d1-d0))"
+  echo "  GET requests served over onion routes (holder saw only a relay): $((o1-o0))"
+  echo "  onion packets relayed: $((r1-r0)), dropped (bad mac / replay): $((x1-x0))" ;;
 esac

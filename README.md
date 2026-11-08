@@ -5,6 +5,7 @@
     scripts/demo.sh big      # 40 MB file = 3 segments
     scripts/demo.sh repair   # kill region B, watch copies get rebuilt, then drop more nodes
     scripts/demo.sh persist  # restart every node, data comes back from disk
+    scripts/demo.sh onion    # same traffic over onion routes: holders never see the requester
     docker service scale da_node-a=20
     scripts/demo.sh down
 
@@ -18,8 +19,8 @@ Client (run inside any node; bridge nodes see both regions):
 ## Pipeline
 1. **Cascade encryption** (crypt.go): AES-256-GCM -> XChaCha20-Poly1305 -> ChaCha20-Poly1305. Each layer key is HKDF-derived
    with a different hash (SHA-256 / SHA3-256 / BLAKE2b) from a random per-file master secret that never leaves the manifest.
-2. **Segments**: the file streams through in 16 MiB segments (no size limit; memory is bounded by one segment). Each segment is one
-   Reed-Solomon codeword, rate 1/2 (K data + K parity, 640 B shards): *any* 50% of its shards recover it. A segment's ciphertext is
+2. **Segments**: the file streams through in ~8 MiB segments (no size limit; memory is bounded by one segment). Each segment is one
+   Reed-Solomon codeword, rate 1/2 (K data + K parity, 256 B shards): *any* 50% of its shards recover it. A segment's ciphertext is
    bound to its index (AEAD associated data), so segments cannot be reordered.
 3. **Merkle root** per segment is the commitment; the manifest lists the roots. Every shard travels with its proof and is verified by storer and fetcher.
 4. **Placement**: shard key = H(root, index); the `REPLICATION` closest nodes by XOR distance hold it.
@@ -31,6 +32,22 @@ Client (run inside any node; bridge nodes see both regions):
    - *erasure rebuild*: for sampled leaves of a root it holds, if no holder has the shard at all, it fetches any K shards, Reed-Solomon reconstructs all of them, checks the result against the Merkle root, and pushes every missing copy. K = total/2 is implied by the fixed rate, and no key is needed because shards are ciphertext.
 
 `LOSS=0.2` env drops 20% of inbound datagrams to watch the probabilistic retrieval cope.
+
+## Onion routing (`ONION=1`)
+Client requests (`STORE` and `GET` for put/get/audit/rebuild) can travel over a fresh random route per attempt: two relays, then the holder.
+
+- **Packets** (`onion.go`): Sphinx-style, exactly one max-size datagram at every hop whatever they carry. Per hop an ephemeral X25519 key,
+  layered routing info with a precomputed filler so the MAC still verifies after each peel, and a LIONESS wide-block cipher on the payload so
+  a modified byte turns the whole payload to noise. Consecutive packets of one route share no bytes.
+- **Replies** use single-use reply blocks (SURBs) the requester ships inside the request. The holder answers into the block; it never learns who or where.
+- **Who sees what:** relay 1 sees the requester's address but only an opaque packet; relay 2 sees neither end; the holder sees the request and a relay.
+  The unit test asserts that no holder ever observes the requester as the source of a served request.
+- **Paths** are drawn from the reachability graph nodes gossip (each peer reports its own peers' keys and the addresses *it* uses), so consecutive hops can really
+  talk, which matters across the two overlay regions. Node ids are `H(onion public key)`, so a key cannot be claimed for another id.
+- **Timing:** relays add a random delay (`ONION_DELAY_MS`), and `COVER_RATE` sends dummy packets. Replays are rejected by a tag cache.
+- **Shard size is 256 B** because a STORE (shard + a depth-16 Merkle proof) and a reply block must fit in one packet.
+- Not hidden: the requester from its *first* relay, and traffic volume from an observer of the whole network (needs real mixing and a lot of cover traffic). No forward secrecy:
+  relay keys are long-lived. Repair traffic between nodes stays direct.
 
 ## Findings / insights
 - **Layers**: stacking ciphers is cheap here (AEAD, ~40 B overhead per layer) and protects against a break of one primitive,

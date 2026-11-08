@@ -139,7 +139,7 @@ svg text{font-family:var(--mono);fill:var(--ink)}
   </g>
 
   <!-- step labels -->
-  <text class="sh" data-steps="0" x="400" y="188" text-anchor="middle" font-size="15">your file, cut into 10 chunks of 640 bytes</text>
+  <text class="sh" data-steps="0" x="400" y="188" text-anchor="middle" font-size="15">your file, cut into 10 chunks of 256 bytes</text>
   <g id="legend"></g>
   <text class="sh mute" data-steps="1" x="400" y="320" text-anchor="middle" font-size="14" style="--d:2.4s">three independent keys, derived from one secret that never leaves your manifest</text>
 
@@ -194,7 +194,7 @@ svg text{font-family:var(--mono);fill:var(--ink)}
     <button class="btn" id="killB">Kill region B</button>
     <button class="btn" id="revive">Revive all</button>
   </div>
-  <div class="ref">Click any node in the diagram to toggle it. This demo uses 20 shards; the real code makes one per 640 bytes of file.</div>
+  <div class="ref">Click any node in the diagram to toggle it. This demo uses 20 shards; the real code makes one per 256 bytes of file.</div>
 </section>
 </div>
 
@@ -206,7 +206,7 @@ const el=(t,a,p)=>{const e=document.createElementNS(NS,t);for(const k in a)e.set
 const mv=(e,x,y)=>{e.style.transform='translate('+x+'px,'+y+'px)'};
 const stage=$('#stage');
 const STEPS=[
- {n:'File',t:'Start with a file',b:'The file is cut into 640-byte chunks. Every chunk will become one shard. Nothing has left your machine yet.',r:'codec.go · Put'},
+ {n:'File',t:'Start with a file',b:'The file is cut into 256-byte chunks. Every chunk will become one shard. Nothing has left your machine yet.',r:'codec.go · Put'},
  {n:'Encrypt',t:'Wrap it in three locks',b:'Three different ciphers are applied one after another, each with its own key from a different hash function. If one cipher ever breaks, the other two still hold. Storage nodes only ever see noise.',r:'crypt.go · AES-GCM → XChaCha20 → ChaCha20'},
  {n:'Encode',t:'Add ten extra shards',b:'Reed-Solomon coding turns 10 data shards into 20. Any 10 of the 20, whichever ones, are enough to rebuild the file. Half the network can disappear.',r:'codec.go · reedsolomon, K data + K parity'},
  {n:'Commit',t:'Fingerprint everything',b:'Every shard is hashed, pairs of hashes are hashed together, up to a single root. The root is a short commitment. Any shard plus a few sibling hashes proves it belongs to it, so nobody can hand you fake data.',r:'merkle.go · verifyShard'},
