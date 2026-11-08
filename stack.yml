@@ -5,10 +5,14 @@
 # Scale any of them:  docker service scale da_node-a=20
 x-node: &node
   image: da:dev
+  volumes: [da-data:/data]
   environment: &env
     REPLICATION: "2"
     LOSS: "0"          # simulated inbound UDP loss, e.g. "0.2"
     MAX_BYTES: "268435456"
+    DATA_DIR: /data                                   # shards + node id survive restarts
+    NODE_NAME: "{{.Service.Name}}-{{.Task.Slot}}"      # stable per-replica subdirectory
+    REPAIR_INTERVAL: "10"                              # seconds between repair sweeps
 
 services:
   node-a:
@@ -32,6 +36,9 @@ services:
       DISCOVER: tasks.node-a,tasks.node-b,tasks.bridge
     networks: [region-a, region-b]
     deploy: { replicas: 2 }
+
+volumes:
+  da-data: {}
 
 networks:
   region-a:
