@@ -31,7 +31,7 @@ func (n *Node) status() map[string]any {
 	}
 	return map[string]any{"id": hex.EncodeToString(n.id[:4]), "peers": len(ps), "peer_list": pl,
 		"shards": shards, "bytes": bytes, "replication": n.cfg.Replication, "loss": n.cfg.Loss,
-		"persistent": n.cfg.DataDir != "", "attached": n.cfg.Attached, "links": n.linkCount(), "nat_dropped": n.natDropped.Load(), "hidden": n.cfg.Hidden, "sid": n.hexSid(), "onion": n.cfg.Onion, "onion_relayed": n.relayed.Load(), "onion_delivered": n.delivered.Load(), "onion_dropped": n.dropped.Load(), "get_direct": n.getDirect.Load(), "get_onion": n.getOnion.Load(), "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
+		"persistent": n.cfg.DataDir != "", "attached": n.cfg.Attached, "links": n.linkCount(), "nat_dropped": n.natDropped.Load(), "sessions": n.sessionCount(), "link_opened": n.linkStat(0), "link_rejected": n.linkStat(1), "link_forged": n.linkStat(2), "link_replayed": n.linkStat(3), "onion_keys": n.okeyCount(), "hidden": n.cfg.Hidden, "sid": n.hexSid(), "onion": n.cfg.Onion, "onion_relayed": n.relayed.Load(), "onion_delivered": n.delivered.Load(), "onion_dropped": n.dropped.Load(), "get_direct": n.getDirect.Load(), "get_onion": n.getOnion.Load(), "roots": roots, "repair_pushed": n.pushed.Load(), "repair_rebuilds": n.rebuilds.Load()}
 }
 
 func (n *Node) serveHTTP() error {

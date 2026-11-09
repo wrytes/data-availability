@@ -237,13 +237,15 @@ footer{border-top:1px solid var(--line);padding-top:24px;color:var(--mute);font-
       <div class="layer"><div><b>Hidden holders</b><small>descriptor, rendezvous</small></div><p>Storage nodes that no one can find or reach directly, only meet through a rendezvous point.</p></div>
       <div class="layer"><div><b>Onion packets</b><small>2 relays + destination</small></div><p>Fixed-size layered packets and one-time reply blocks. Holders see a request, never the requester.</p></div>
       <div class="layer"><div><b>Links</b><small>guards, keepalive, link ids</small></div><p>Attached nodes dial out to three guards and stay reachable through them, even behind NAT.</p></div>
+      <div class="layer"><div><b>Sessions</b><small>signed handshake, AEAD</small></div><p>Every datagram is sealed inside a session whose peer proved its identity. Forged, modified and replayed packets die at the door.</p></div>
       <div class="layer"><div><b>UDP</b><small>datagrams, 1400 bytes</small></div><p>Letters with an address on them. No connection, no receipts. Loss is expected and tolerated.</p></div>
     </div>
     <div class="tbl"><table>
       <tr><th></th><th>Tor</th><th>This project</th></tr>
       <tr><td>Transport</td><td>TCP with TLS between relays</td><td>UDP datagrams</td></tr>
       <tr><td>Paths</td><td>Circuits built hop by hop, then streams</td><td>Each request is a one-shot onion packet, no circuits</td></tr>
-      <tr><td>Forward secrecy</td><td>Yes, keys are per circuit</td><td>No, relay keys are long-lived</td></tr>
+      <tr><td>Forward secrecy</td><td>Yes, keys are per circuit</td><td>Per key epoch: onion keys rotate every few minutes and are deleted</td></tr>
+      <tr><td>Link security</td><td>TLS between relays, identity pinned by the consensus</td><td>Signed handshake per link; ids pinned from gossip; encrypted, replay-protected</td></tr>
       <tr><td>Relay list</td><td>Signed consensus from directory authorities</td><td>Gossip between peers, no authorities</td></tr>
       <tr><td>Behind NAT</td><td>Clients and services dial out to relays</td><td>Attached nodes dial out to three guards</td></tr>
       <tr><td>Hidden services</td><td>Introduction and rendezvous points</td><td>The same idea, simplified</td></tr>

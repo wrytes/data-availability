@@ -2,9 +2,13 @@ package main
 
 import "encoding/binary"
 
-// Wire format (one UDP datagram, kept <= maxDatagram to survive overlay MTU):
+// Wire format. A UDP datagram is a link-layer packet (see link.go, at most
+// maxDatagram bytes to survive overlay MTU); inside a session it carries
 //
-//	type u8 | reqid u64 | sender node id [32] | body
+//	type u8 | reqid u64 | body
+//
+// The sender is not named in the message: it is the identity that
+// authenticated the session.
 const (
 	tPing  byte = 1
 	tPong  byte = 2
@@ -16,7 +20,7 @@ const (
 	tHasR  byte = 8 // body: status u8 (0 held, 1 not held)
 	tOnion byte = 9 // fixed-size onion packet, see onion.go
 
-	hdrLen      = 1 + 8 + 32
+	hdrLen      = 1 + 8
 	maxDatagram = 1400
 )
 
@@ -25,7 +29,8 @@ type Hash = [32]byte
 type msg struct {
 	typ  byte
 	id   uint64
-	from Hash
+	from Hash     // set by the link layer: the authenticated sender
+	ik   [32]byte // and its identity key
 	body []byte
 }
 
@@ -33,7 +38,6 @@ func (m msg) marshal() []byte {
 	b := make([]byte, 0, hdrLen+len(m.body))
 	b = append(b, m.typ)
 	b = binary.BigEndian.AppendUint64(b, m.id)
-	b = append(b, m.from[:]...)
 	return append(b, m.body...)
 }
 
@@ -42,7 +46,6 @@ func unmarshal(b []byte) (msg, bool) {
 		return msg{}, false
 	}
 	m := msg{typ: b[0], id: binary.BigEndian.Uint64(b[1:9]), body: b[hdrLen:]}
-	copy(m.from[:], b[9:hdrLen])
 	return m, true
 }
 

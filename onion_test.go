@@ -40,7 +40,7 @@ func hopsOf(ns []tnode) []hop {
 }
 
 func TestOnionSizes(t *testing.T) {
-	if hdrLen+onionHdr+onionD != maxDatagram {
+	if hdrLen+onionHdr+onionD != maxPlain {
 		t.Fatal("onion packet is not exactly one max datagram")
 	}
 	// the biggest request (STORE with a depth-16 proof) and reply (DATA) must fit
