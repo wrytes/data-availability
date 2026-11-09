@@ -2,7 +2,7 @@
 
     scripts/demo.sh up       # build image, deploy stack (2 regions + bridges), wait for gossip
     scripts/demo.sh demo     # put -> get -> audit
-    scripts/demo.sh big      # 40 MB file = 3 segments
+    scripts/demo.sh big      # 40 MB file = 5 segments
     scripts/demo.sh repair   # kill region B, watch copies get rebuilt, then drop more nodes
     scripts/demo.sh persist  # restart every node, data comes back from disk
     scripts/demo.sh onion    # same traffic over onion routes: holders never see the requester
@@ -103,7 +103,7 @@ Tests: `TestLinkAuth`, `TestLinkRekey`, `TestOnionForwardSecrecy`. `node.key` fr
   but only if keys are independent (they are). It does *not* add security against a key leak, nor hide size.
 - **Small stripes break sampling; big segments fix it, but not for free.** Encoding every 10 KB stripe separately lets an adversary hide
   11/20 shards of ONE stripe (0.2% of the file) and random sampling almost never notices. One codeword per segment (GF(2^16)
-  Leopard, up to 65 536 shards ≈ 21 MB) makes the 50% threshold global *within* a segment. Files are split into segments, so an audit now
+  Leopard, up to 65 536 shards of 256 B ≈ 8 MiB of data + 8 MiB parity) makes the 50% threshold global *within* a segment. Files are split into segments, so an audit now
   has to sample every segment (cost grows with file size). Coding across segments (2D, as in danksharding/Celestia) would let a fixed
   number of samples cover the whole file; that is the next step.
 - **Compression** does not help here: ciphertext is incompressible, and compress-then-encrypt leaks size patterns. If wanted, do it before `put`.

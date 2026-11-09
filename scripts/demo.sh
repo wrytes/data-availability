@@ -53,7 +53,7 @@ demo)
   echo "== audit (30 samples per segment)"; client audit - 30 < /tmp/da-m.json; echo ;;
 big)
   head -c 40000000 /dev/urandom > /tmp/da-big.bin
-  echo "== put 40MB (more than one 16 MiB segment)"; time putfile /tmp/da-big.bin
+  echo "== put 40MB (about 5 segments of ~8 MiB)"; time putfile /tmp/da-big.bin
   echo "== get + verify"; time check /tmp/da-big.bin
   echo "== audit"; client audit - 20 < /tmp/da-m.json; echo ;;
 persist)
