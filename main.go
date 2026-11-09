@@ -43,10 +43,13 @@ func main() {
 		cv, _ := strconv.ParseFloat(env("COVER_RATE", "0"), 64)
 		hid := env("HIDDEN", "0") == "1"
 		gd, _ := strconv.Atoi(env("GUARDS", "3"))
+		ll, _ := strconv.Atoi(env("LINK_LIFE_S", "120"))
+		okl, _ := strconv.Atoi(env("ONION_KEY_LIFE_S", "600"))
 		n, err := NewNode(Config{Port: port, HTTP: env("HTTP", ":8080"), Discover: parseDiscover(env("DISCOVER", "")),
 			Replication: rep, MaxBytes: mb, Loss: loss, DataDir: env("DATA_DIR", ""), NodeName: env("NODE_NAME", ""),
 			RepairEvery: time.Duration(rs) * time.Second, Onion: on, OnionDelay: time.Duration(od) * time.Millisecond, Cover: cv, Hidden: hid,
-			Attached: env("ATTACHED", "0") == "1", Guards: gd, NATFilter: env("NAT_FILTER", "0") == "1"})
+			Attached: env("ATTACHED", "0") == "1", Guards: gd, NATFilter: env("NAT_FILTER", "0") == "1",
+			LinkLife: time.Duration(ll) * time.Second, OnionKeyLife: time.Duration(okl) * time.Second})
 		if err != nil {
 			log.Fatal(err)
 		}

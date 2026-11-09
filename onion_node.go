@@ -36,7 +36,7 @@ func (n *Node) handleOnion(m msg, src netip.AddrPort) {
 		n.dropped.Add(1)
 		return
 	}
-	pl, err := peelHeader(n.priv, h)
+	pl, err := n.peelAny(h)
 	if err != nil || n.replayed(pl.tag) {
 		n.dropped.Add(1)
 		return
@@ -192,22 +192,23 @@ func (n *Node) onionReply(id uint64, delta []byte) {
 func (n *Node) pickFwd(dest Hash) ([]hop, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	dpub, ok := n.pubOfLocked(dest)
+	now := time.Now()
+	dkey, ok := n.okOfLocked(dest, now)
 	if !ok {
 		return nil, false
 	}
 	type cand struct{ r0, r1 *peer }
 	var cs []cand
 	for _, r0 := range n.peers {
-		if r0.id == dest || !r0.hasPub {
+		if r0.id == dest || !r0.live(now) {
 			continue
 		}
 		for id1 := range r0.nbrs {
 			r1 := n.peers[id1]
-			if r1 == nil || !r1.hasPub || id1 == dest || id1 == r0.id {
+			if r1 == nil || !r1.live(now) || id1 == dest || id1 == r0.id {
 				continue
 			}
-			if _, ok := r1.nbrs[dest]; ok {
+			if nb, ok := r1.nbrs[dest]; ok && nb.okExp.After(now) {
 				cs = append(cs, cand{r0, r1})
 			}
 		}
@@ -217,19 +218,24 @@ func (n *Node) pickFwd(dest Hash) ([]hop, bool) {
 	}
 	c := cs[mrand.Intn(len(cs))]
 	return []hop{
-		{pub: c.r0.pub, addr: c.r0.addr},
-		{pub: c.r1.pub, addr: c.r0.nbrs[c.r1.id].addr},
-		{pub: dpub, addr: c.r1.nbrs[dest].addr},
+		{pub: c.r0.ok, addr: c.r0.addr},
+		{pub: c.r1.ok, addr: c.r0.nbrs[c.r1.id].addr},
+		{pub: dkey, addr: c.r1.nbrs[dest].addr},
 	}, true
 }
 
-func (n *Node) pubOfLocked(id Hash) ([32]byte, bool) {
-	if p := n.peers[id]; p != nil && p.hasPub {
-		return p.pub, true
+// live: we hold a key certificate that has not expired.
+func (p *peer) live(now time.Time) bool { return p.hasPub && p.okExp.After(now) }
+
+// okOfLocked is the current onion key of a node: first-hand if it is our
+// peer, else from a neighbour list (still verified against the node's own signature).
+func (n *Node) okOfLocked(id Hash, now time.Time) ([32]byte, bool) {
+	if p := n.peers[id]; p != nil && p.live(now) {
+		return p.ok, true
 	}
 	for _, p := range n.peers {
-		if nb, ok := p.nbrs[id]; ok {
-			return nb.pub, true
+		if nb, ok := p.nbrs[id]; ok && nb.okExp.After(now) {
+			return nb.ok, true
 		}
 	}
 	return [32]byte{}, false
@@ -242,6 +248,7 @@ func (n *Node) pubOfLocked(id Hash) ([32]byte, bool) {
 func (n *Node) pickBack(dest Hash) ([]hop, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
+	now := time.Now()
 	type cand struct {
 		r0, r1 *peer
 		a0     netip.AddrPort
@@ -250,7 +257,7 @@ func (n *Node) pickBack(dest Hash) ([]hop, bool) {
 	add := func(r0 *peer, a0 netip.AddrPort) {
 		for id1 := range r0.nbrs {
 			r1 := n.peers[id1]
-			if r1 == nil || !r1.hasPub || id1 == dest || id1 == r0.id || (!n.cfg.Attached && !r1.me.IsValid()) {
+			if r1 == nil || !r1.live(now) || id1 == dest || id1 == r0.id || (!n.cfg.Attached && !r1.me.IsValid()) {
 				continue
 			}
 			cs = append(cs, cand{r0, r1, a0})
@@ -258,13 +265,13 @@ func (n *Node) pickBack(dest Hash) ([]hop, bool) {
 	}
 	if d := n.peers[dest]; d != nil {
 		for id0, a0 := range d.nbrs { // precise: first relay as the destination itself sees it
-			if r0 := n.peers[id0]; r0 != nil && r0.hasPub && id0 != dest {
+			if r0 := n.peers[id0]; r0 != nil && r0.live(now) && id0 != dest {
 				add(r0, a0.addr)
 			}
 		}
 	} else { // destination is not our direct peer: use relays that list it as a neighbour
 		for _, r0 := range n.peers {
-			if _, ok := r0.nbrs[dest]; ok && r0.hasPub && r0.id != dest {
+			if _, ok := r0.nbrs[dest]; ok && r0.live(now) && r0.id != dest {
 				add(r0, r0.addr)
 			}
 		}
@@ -273,14 +280,15 @@ func (n *Node) pickBack(dest Hash) ([]hop, bool) {
 		return nil, false
 	}
 	c := cs[mrand.Intn(len(cs))]
-	last := hop{pub: n.pub, addr: c.r1.me}
+	mine, _ := n.myOnionKey()
+	last := hop{pub: mine, addr: c.r1.me}
 	if n.cfg.Attached {
 		l := n.linkFor(c.r1.addr)
-		last = hop{pub: n.pub, link: &l}
+		last = hop{pub: mine, link: &l}
 	}
 	return []hop{
-		{pub: c.r0.pub, addr: c.a0},
-		{pub: c.r1.pub, addr: c.r0.nbrs[c.r1.id].addr},
+		{pub: c.r0.ok, addr: c.a0},
+		{pub: c.r1.ok, addr: c.r0.nbrs[c.r1.id].addr},
 		last,
 	}, true
 }

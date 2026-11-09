@@ -30,11 +30,21 @@ const (
 	rebuildGap   = 20 * time.Second
 )
 
+// repairCall talks to a holder. An attached or hidden node must not contact
+// anyone but its guards directly (that would list it in their tables and give
+// its address away), so it repairs over onion routes like any other client.
+func (n *Node) repairCall(ctx context.Context, h target, typ byte, body []byte, timeout time.Duration, tries int) (msg, error) {
+	if n.cfg.Attached {
+		return n.rpc(ctx, h, typ, body, timeout, tries)
+	}
+	return n.call(ctx, h.addr, typ, body, timeout, tries)
+}
+
 func (n *Node) has(ctx context.Context, h target, root Hash, leaf uint32) (has, known bool) {
 	if h.self {
 		return n.store.has(root, leaf), true
 	}
-	m, err := n.call(ctx, h.addr, tHas, encGet(root, leaf), 300*time.Millisecond, 2)
+	m, err := n.repairCall(ctx, h, tHas, encGet(root, leaf), 300*time.Millisecond, 2)
 	if err != nil || len(m.body) == 0 {
 		return false, false
 	}
@@ -45,7 +55,7 @@ func (n *Node) push(ctx context.Context, h target, root Hash, leaf, total uint32
 	if h.self {
 		return n.putLocal(root, leaf, total, data, proof, false) == 0
 	}
-	m, err := n.call(ctx, h.addr, tStore, encStore(root, leaf, total, data, proof), 500*time.Millisecond, 3)
+	m, err := n.repairCall(ctx, h, tStore, encStore(root, leaf, total, data, proof), 500*time.Millisecond, 3)
 	return err == nil && len(m.body) > 0 && m.body[0] == 0
 }
 

@@ -15,10 +15,11 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// Onion packets, Sphinx-style. Every packet is exactly maxDatagram bytes, on
-// every hop, whatever it carries:
+// Onion packets, Sphinx-style. Every packet is exactly maxPlain bytes inside
+// the link layer (so exactly maxDatagram on the wire), on every hop, whatever
+// it carries:
 //
-//	hdr(41, link level) | e(32) | gamma(16) | beta(165) | delta(1146)
+//	hdr(9) | e(32) | gamma(16) | beta(165) | delta(1146)
 //
 // e      one-shot X25519 public key for this hop (fresh per hop, per packet)
 // beta   routing info, stream-encrypted in layers; each hop peels one record
@@ -38,7 +39,7 @@ const (
 	onionH   = 3  // hops on every path: 2 relays + destination
 	onionB   = onionR * onionH
 	onionHdr = 32 + 16 + onionB
-	onionD   = maxDatagram - hdrLen - onionHdr
+	onionD   = maxPlain - hdrLen - onionHdr
 	surbLen  = 6 + onionHdr + 16
 	zeroLen  = 8 // integrity prefix inside the payload
 

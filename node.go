@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/ecdh"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -39,28 +39,37 @@ type Config struct {
 	Attached   bool          // behind NAT: only dials out to a few guards, keeps those links alive, is never listed
 	Guards     int           // how many guards an attached node keeps (default 3)
 	NATFilter  bool          // test/demo: drop inbound packets from addresses we have not sent to (stateful NAT/firewall)
+
+	LinkLife     time.Duration // sessions are re-keyed after this long (default 2m)
+	OnionKeyLife time.Duration // onion keys live this long, rotate at half of it, and are deleted shortly after (default 10m)
 }
 
 // nbr is what a peer told us about one of its own peers: the key and the
 // address *that peer* uses to reach it. This is the reachability graph that
 // onion paths are drawn from (consecutive hops must be able to talk).
 type nbr struct {
-	pub  [32]byte
-	addr netip.AddrPort
-	seen time.Time
+	pub   [32]byte // identity key
+	addr  netip.AddrPort
+	seen  time.Time
+	ok    [32]byte // onion key, from a certificate signed by pub
+	okExp time.Time
+	cert  []byte
 }
 
 type peer struct {
 	id     Hash
 	addr   netip.AddrPort
 	seen   time.Time
-	pub    [32]byte
-	hasPub bool
+	pub    [32]byte // identity key, proven by the link handshake
+	hasPub bool     // we hold a valid onion key certificate for it
+	ok     [32]byte // its current onion key
+	okExp  time.Time
+	cert   []byte
 	me     netip.AddrPort // how this peer sees us
 	nbrs   map[Hash]nbr
 }
 
-// idOf binds a node id to its onion key, so a key cannot be claimed for a
+// idOf binds a node id to its identity key, so a key cannot be claimed for a
 // foreign id.
 func idOf(pub []byte) Hash {
 	h := sha256.New()
@@ -72,16 +81,21 @@ func idOf(pub []byte) Hash {
 }
 
 type linkEntry struct {
-	addr netip.AddrPort
-	seen time.Time
+	addr  netip.AddrPort
+	seen  time.Time
+	owner Hash // only the authenticated node that created a link id may move it
 }
 
 type Node struct {
 	cfg  Config
 	id   Hash
-	priv *ecdh.PrivateKey
-	pub  [32]byte
+	sk   ed25519.PrivateKey // identity
+	pub  [32]byte           // identity public key
 	conn atomic.Pointer[net.UDPConn]
+	lk   *linkState
+
+	okMu  sync.Mutex
+	okeys []*okey // live onion keys, oldest first
 
 	mu    sync.RWMutex
 	peers map[Hash]*peer
@@ -149,7 +163,7 @@ func NewNode(cfg Config) (*Node, error) {
 			cfg.Onion = 2 // an attached node has no direct path to anyone but its guards
 		}
 	}
-	n := &Node{cfg: cfg, links: map[[6]byte]linkEntry{}, out: map[netip.AddrPort]time.Time{}, peers: map[Hash]*peer{}, tried: map[netip.AddrPort]time.Time{},
+	n := &Node{cfg: cfg, lk: newLinkState(), links: map[[6]byte]linkEntry{}, out: map[netip.AddrPort]time.Time{}, peers: map[Hash]*peer{}, tried: map[netip.AddrPort]time.Time{},
 		pend: map[uint64]chan msg{}, store: st, cool: map[Hash]time.Time{}, cursor: map[Hash]int{}, done: make(chan struct{}),
 		hs: newHsState(), private: map[Hash]bool{}, surbs: map[uint64]*surbEntry{}, seen: map[[16]byte]time.Time{}}
 	n.conn.Store(c)
@@ -158,6 +172,7 @@ func NewNode(cfg Config) (*Node, error) {
 		c.Close()
 		return nil, err
 	}
+	n.rotateKeys()
 	if cnt, b := st.stats(); cnt > 0 {
 		log.Printf("restored %d shards (%d bytes) from %s", cnt, b, dir)
 	}
@@ -181,34 +196,29 @@ func NewNode(cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// loadKey keeps the node key (and so its id) stable across restarts, so
-// placement stays valid.
+// loadKey keeps the identity key (and so the node id) stable across restarts,
+// so placement stays valid. Onion keys are never stored: they are meant to be lost.
 func (n *Node) loadKey(dir string) error {
-	curve := ecdh.X25519()
 	if dir != "" {
-		if b, err := os.ReadFile(filepath.Join(dir, "node.key")); err == nil && len(b) == 32 {
-			k, err := curve.NewPrivateKey(b)
-			if err != nil {
-				return err
-			}
-			n.setKey(k)
+		if b, err := os.ReadFile(filepath.Join(dir, "node.key")); err == nil && len(b) == ed25519.SeedSize {
+			n.setKey(ed25519.NewKeyFromSeed(b))
 			return nil
 		}
 	}
-	k, err := curve.GenerateKey(rand.Reader)
+	_, k, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return err
 	}
 	n.setKey(k)
 	if dir != "" {
-		return os.WriteFile(filepath.Join(dir, "node.key"), k.Bytes(), 0o600)
+		return os.WriteFile(filepath.Join(dir, "node.key"), k.Seed(), 0o600)
 	}
 	return nil
 }
 
-func (n *Node) setKey(k *ecdh.PrivateKey) {
-	n.priv = k
-	copy(n.pub[:], k.PublicKey().Bytes())
+func (n *Node) setKey(k ed25519.PrivateKey) {
+	n.sk = k
+	copy(n.pub[:], k.Public().(ed25519.PublicKey))
 	n.id = idOf(n.pub[:])
 }
 
@@ -252,19 +262,11 @@ func (n *Node) linkAddr(id [6]byte) (netip.AddrPort, bool) {
 }
 
 func (n *Node) send(to netip.AddrPort, m msg) {
-	m.from = n.id
 	b := m.marshal()
-	if len(b) > maxDatagram {
+	if len(b) > maxPlain {
 		return
 	}
-	if n.cfg.NATFilter {
-		n.outMu.Lock()
-		n.out[to] = time.Now()
-		n.outMu.Unlock()
-	}
-	if c := n.conn.Load(); c != nil {
-		c.WriteToUDPAddrPort(b, to)
-	}
+	n.linkSend(to, b)
 }
 
 func (n *Node) recvLoop(c *net.UDPConn) {
@@ -280,10 +282,6 @@ func (n *Node) recvLoop(c *net.UDPConn) {
 		if n.cfg.Loss > 0 && mrand.Float64() < n.cfg.Loss {
 			continue
 		}
-		m, ok := unmarshal(append([]byte(nil), buf[:l]...))
-		if !ok || m.from == n.id {
-			continue
-		}
 		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
 		if n.cfg.NATFilter { // a stateful NAT only lets replies from addresses we contacted
 			n.outMu.Lock()
@@ -294,14 +292,23 @@ func (n *Node) recvLoop(c *net.UDPConn) {
 				continue
 			}
 		}
-		if m.typ == tPing && len(m.body) > 32 && m.body[32]&1 != 0 {
-			n.markPrivate(m.from)                       // attached/hidden node: answer so it learns its address, never list it
-			if m.body[32]&2 != 0 && len(m.body) >= 39 { // and remember where its link currently points
+		plain, from, ik, ok := n.linkRecv(buf[:l], src)
+		if !ok {
+			continue
+		}
+		m, ok := unmarshal(plain)
+		if !ok || from == n.id {
+			continue
+		}
+		m.from, m.ik = from, ik
+		if m.typ == tPing && len(m.body) >= 1 && m.body[0]&1 != 0 {
+			n.markPrivate(m.from)                     // attached/hidden node: answer so it learns its address, never list it
+			if m.body[0]&2 != 0 && len(m.body) >= 7 { // and remember where its link currently points
 				var id [6]byte
-				copy(id[:], m.body[33:39])
+				copy(id[:], m.body[1:7])
 				n.linkMu.Lock()
-				if len(n.links) < 8192 {
-					n.links[id] = linkEntry{src, time.Now()}
+				if e, had := n.links[id]; (!had || e.owner == m.from || time.Since(e.seen) > 30*time.Second) && len(n.links) < 8192 {
+					n.links[id] = linkEntry{src, time.Now(), m.from}
 				}
 				n.linkMu.Unlock()
 			}
@@ -344,23 +351,21 @@ func (n *Node) handle(m msg, src netip.AddrPort) {
 	}
 	switch m.typ {
 	case tPing:
-		pub := m.body
-		if len(pub) < 32 || idOf(pub[:32]) != m.from {
-			return
-		}
-		n.setPub(m.from, pub[:32])
-		b := append([]byte{}, n.pub[:]...)
-		b = append(b, make([]byte, 6)...)
-		putAddr(b[32:], src)
+		_, cert := n.myOnionKey()
+		b := make([]byte, 6, 6+len(cert))
+		putAddr(b, src)
+		b = append(b, cert...)
 		n.send(src, msg{typ: tPong, id: m.id, body: append(b, n.gossipBody()...)})
 	case tPong:
 		r := &rd{b: m.body}
-		pub := r.take(32)
 		me := getAddr(r.take(6))
-		if r.bad || idOf(pub) != m.from {
+		cert := append([]byte(nil), r.take(certLen)...)
+		if r.bad {
 			return
 		}
-		n.setPub(m.from, pub)
+		if !n.setPeerKey(m.from, m.ik, cert) {
+			return
+		}
 		n.learn(m.from, me, r.b)
 		n.deliver(m)
 	case tAck, tData, tHasR:
@@ -412,13 +417,19 @@ func (n *Node) serve(typ byte, body []byte) (byte, []byte, bool) {
 	return 0, nil, false
 }
 
-func (n *Node) setPub(id Hash, pub []byte) {
+// setPeerKey records a peer's onion key certificate, after checking that its
+// identity (proven by the link) signed it.
+func (n *Node) setPeerKey(id Hash, ik [32]byte, cert []byte) bool {
+	ok, exp, valid := verifyCert(ik, cert)
+	if !valid || !exp.After(time.Now()) {
+		return false
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if p, ok := n.peers[id]; ok {
-		copy(p.pub[:], pub)
-		p.hasPub = true
+	if p, exists := n.peers[id]; exists {
+		p.pub, p.ok, p.okExp, p.cert, p.hasPub = ik, ok, exp, cert, true
 	}
+	return true
 }
 
 // putLocal returns 0 ok, 1 invalid, 2 full, 3 io error.
@@ -467,34 +478,37 @@ func (n *Node) call(ctx context.Context, to netip.AddrPort, typ byte, body []byt
 
 // ---- discovery -------------------------------------------------------------
 
+// gossipMax entries of ik(32)+addr(6)+cert(100) must fit a PONG next to its own certificate.
+const gossipMax = 8
+
 func (n *Node) gossipBody() []byte {
 	n.mu.RLock()
 	ps := make([]*peer, 0, len(n.peers))
 	for _, p := range n.peers {
-		if p.hasPub {
+		if p.hasPub && p.okExp.After(time.Now()) {
 			ps = append(ps, p)
 		}
 	}
 	mrand.Shuffle(len(ps), func(i, j int) { ps[i], ps[j] = ps[j], ps[i] })
-	if len(ps) > 12 {
-		ps = ps[:12]
+	if len(ps) > gossipMax {
+		ps = ps[:gossipMax]
 	}
 	b := []byte{byte(len(ps))}
 	for _, p := range ps {
 		b = append(b, p.pub[:]...)
 		b = append(b, make([]byte, 6)...)
 		putAddr(b[len(b)-6:], p.addr)
+		b = append(b, p.cert...) // the peer's own signed onion key: relayed, never re-signed
 	}
 	n.mu.RUnlock()
 	return b
 }
 
 func (n *Node) sendPing(to netip.AddrPort) {
-	body := append([]byte{}, n.pub[:]...)
+	body := []byte{0}
 	if n.cfg.Attached {
 		l := n.linkFor(to)
-		body = append(body, 1|2) // private: do not list or gossip me; keep a link for me
-		body = append(body, l[:]...)
+		body = append([]byte{1 | 2}, l[:]...) // private: do not list or gossip me; keep a link for me
 	}
 	n.send(to, msg{typ: tPing, id: mrand.Uint64(), body: body})
 }
@@ -511,20 +525,24 @@ func (n *Node) learn(from Hash, me netip.AddrPort, body []byte) {
 	r := &rd{b: body}
 	cnt := int(r.u8())
 	for i := 0; i < cnt; i++ {
-		pub := append([]byte(nil), r.take(32)...)
+		var ik [32]byte
+		copy(ik[:], r.take(32))
 		ap := getAddr(r.take(6))
+		cert := append([]byte(nil), r.take(certLen)...)
 		if r.bad {
 			return
 		}
-		id := idOf(pub)
+		id := idOf(ik[:])
 		if id == n.id {
+			continue
+		}
+		okey, exp, valid := verifyCert(ik, cert) // the neighbour's own signature, so the reporting peer cannot swap keys
+		if !valid || !exp.After(time.Now()) {
 			continue
 		}
 		n.mu.Lock()
 		if p, ok := n.peers[from]; ok {
-			var rec nbr
-			copy(rec.pub[:], pub)
-			rec.addr, rec.seen = ap, time.Now()
+			rec := nbr{pub: ik, addr: ap, seen: time.Now(), ok: okey, okExp: exp, cert: cert}
 			p.nbrs[id] = rec
 		}
 		t, seen := n.tried[ap]
@@ -538,6 +556,7 @@ func (n *Node) learn(from Hash, me netip.AddrPort, body []byte) {
 		if !known && !n.cfg.Attached && (!seen || time.Since(t) > 10*time.Second) {
 			n.tried[ap] = time.Now()
 			n.mu.Unlock()
+			n.pinAddr(ap, id) // the handshake must find exactly this node there
 			n.sendPing(ap)
 			continue
 		}
@@ -590,6 +609,8 @@ func (n *Node) maintainLoop() {
 		}
 		n.mu.Unlock()
 		n.pruneOnion()
+		n.rotateKeys()
+		n.pruneLinks()
 
 		ps := n.peerList()
 		if !n.cfg.Attached {

@@ -56,6 +56,7 @@ func TestAttachedBehindNAT(t *testing.T) {
 	}
 
 	// 3. it works as a client using only its guards
+	time.Sleep(2 * time.Second) // the stranger's handshake retries may still trickle in; they are not ours
 	dropped := a.natDropped.Load()
 	pt := make([]byte, 30_000)
 	rand.Read(pt)

@@ -78,6 +78,26 @@ A node with no reachable port dials out to a few public guards (`GUARDS`, defaul
 
 Limits: NAT is simulated, not real; no hole punching; source addresses are spoofable (no link-level auth); networks that block UDP still need a TCP/TLS fallback.
 
+## Link authentication and forward secrecy
+
+**Links.** Every datagram travels inside a session (`link.go`). A 3-message SIGMA-style handshake mixes fresh X25519 keys (session keys come
+from these alone) and signs the transcript with each node's Ed25519 identity (`node.key` is the seed; id = sha256 of the public key).
+- The sender of a message is the identity that authenticated the session: no spoofed sender ids, no forged or modified datagrams
+  (ChaCha20-Poly1305), replays dropped (64-wide window per session).
+- Pinning: an id learned from gossip is expected at that address; a different identity aborts the handshake.
+- Sessions re-key every `LINK_LIFE_S` (120). Sessions follow a peer across address changes (NAT rebind), but only on an authentic fresh packet.
+- Attached/hidden nodes never accept inbound handshakes, so a scan cannot even tell they exist.
+- A link id at a guard can only be moved by the node that created it.
+- Cost: 29 B per datagram (the sender id field, 32 B, is gone, so onion payloads are 3 B larger than before).
+
+**Onion forward secrecy.** Relays no longer peel with a long-term key. They use X25519 onion keys, new every `ONION_KEY_LIFE_S`/2 (600/2),
+signed by the node identity (certificate `key|expiry|sig`, gossiped as is, so a middleman cannot swap a relay's key), kept for the key life
+plus half again, then deleted. A recorded packet cannot be opened later, not even by the relay it passed.
+
+Limits: forward secrecy is per key epoch (minutes), not per circuit as in Tor; a relay compromised *during* an epoch exposes that epoch's traffic.
+Handshake floods cost CPU (state is capped at 512, no cookie/puzzle yet). Pinning needs an id; bootstrap addresses from DNS are trusted on first contact.
+Tests: `TestLinkAuth`, `TestLinkRekey`, `TestOnionForwardSecrecy`. `node.key` from older versions is read as an Ed25519 seed, so those nodes get new ids.
+
 ## Findings / insights
 - **Layers**: stacking ciphers is cheap here (AEAD, ~40 B overhead per layer) and protects against a break of one primitive,
   but only if keys are independent (they are). It does *not* add security against a key leak, nor hide size.
@@ -97,5 +117,5 @@ Limits: NAT is simulated, not real; no hole punching; source addresses are spoof
 - Repair is uncoordinated: guardians of a root use jitter + a cooldown instead of leader election, and detection is by sampling, so tiny losses may take several sweeps. A rebuild needs K shards reachable at once; if fewer survive, the data is gone.
 - Shards are not fsynced (a power cut can lose the newest ones; repair then restores them if copies exist elsewhere), and there is one file per shard.
 - No stake/slashing or proof-of-storage challenges (audit is a sampler, not an incentive).
-- Node IDs are free (Sybil), packets are unauthenticated (spoofable source), the HTTP API has no auth, so keep it unpublished.
+- Node IDs are free (Sybil), the HTTP API has no auth, so keep it unpublished. Links are authenticated, but a node still cannot tell an honest relay from a hostile one.
 - Placement uses each node's own peer view; views differ slightly, so fetches probe `REPLICATION+3` closest nodes.
